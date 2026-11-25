@@ -1,0 +1,6 @@
+{
+  "name": "डाटा रिमार्क पोर्टल",
+  "description": "रोल-आधारित Excel डाटा सर्च और फील्ड रिमार्क प्रबंधन ऐप (Admin, JE, Supervisor, Lineman)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
