@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
-import path from 'node:path';
 import { createServer as createViteServer } from 'vite';
 import {
   addRemark,
@@ -12,14 +14,15 @@ import {
   deleteRemark,
   deleteUserAccount,
   getActiveDataset,
-  getAllRemarksForDatasetAdmin,
-  getDatasetRows,
+  getAllRemarksByRowAdmin,
+  getDistinctColumnValues,
   getEnvAdminConfig,
   getUserBySessionToken,
-  getVisibleRemarksForDataset,
   isValidRole,
+  iterateDatasetRows,
   listUsers,
   needsAdminSetup,
+  queryDatasetRows,
   revokeSession,
   saveNewDataset,
   updateOwnRemark,
@@ -27,10 +30,10 @@ import {
 } from './server/db.ts';
 import type { SafeUser } from './server/db.ts';
 import {
-  buildExportWorkbookBuffer,
   buildSampleTemplateBuffer,
-  parseUploadedSpreadsheet,
   SAMPLE_UTILITY_DATA,
+  streamExportWorkbookToResponse,
+  streamImportSpreadsheetFromFile,
 } from './server/excel.ts';
 
 interface AuthedRequest extends Request {
@@ -38,8 +41,67 @@ interface AuthedRequest extends Request {
   authToken?: string;
 }
 
+interface UploadSession {
+  id: string;
+  userId: number;
+  fileName: string;
+  expectedSize: number;
+  receivedBytes: number;
+  tempFilePath: string;
+  createdAt: number;
+}
+
 const PORT = Number(process.env.PORT) || 3000;
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10MB
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB
+const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MB chunks (safe through reverse proxies)
+const UPLOAD_SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+const tmpUploadDir = path.resolve(process.cwd(), 'data', 'tmp_uploads');
+fs.mkdirSync(tmpUploadDir, { recursive: true });
+
+// Clean up any stale temp files from prior server runs
+try {
+  for (const entry of fs.readdirSync(tmpUploadDir)) {
+    const candidate = path.resolve(tmpUploadDir, entry);
+    if (candidate.startsWith(tmpUploadDir + path.sep) && entry.endsWith('.part')) {
+      fs.unlinkSync(candidate);
+    }
+  }
+} catch {
+  // ignore cleanup errors on startup
+}
+
+const uploadSessions = new Map<string, UploadSession>();
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function resolveTempUploadPath(uploadId: string): string {
+  const resolved = path.resolve(tmpUploadDir, `${uploadId}.part`);
+  if (!resolved.startsWith(tmpUploadDir + path.sep)) {
+    throw new Error('INVALID_UPLOAD_PATH');
+  }
+  return resolved;
+}
+
+async function cleanupUploadSession(uploadId: string): Promise<void> {
+  const session = uploadSessions.get(uploadId);
+  if (!session) return;
+  uploadSessions.delete(uploadId);
+  try {
+    await fs.promises.unlink(session.tempFilePath);
+  } catch {
+    // file may already be deleted
+  }
+}
+
+function purgeExpiredUploadSessions(): void {
+  const now = Date.now();
+  for (const [id, session] of uploadSessions.entries()) {
+    if (now - session.createdAt > UPLOAD_SESSION_TTL_MS) {
+      void cleanupUploadSession(id);
+    }
+  }
+}
 
 // Simple in-memory rate limit for login attempts per IP
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -92,7 +154,7 @@ function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): vo
 async function startServer(): Promise<void> {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '16mb' }));
+  app.use(express.json({ limit: '4mb' }));
 
   // --- Auth Routes ---
 
@@ -315,34 +377,68 @@ async function startServer(): Promise<void> {
     }
   });
 
-  // --- Dataset & Excel Upload/Export Routes ---
+  // --- Dataset Query & Column Values Routes (Server-Side Search & Pagination) ---
 
   app.get('/api/dataset', requireAuth, (req: AuthedRequest, res: Response) => {
     const dataset = getActiveDataset();
     if (!dataset) {
-      res.json({ dataset: null, rows: [], remarksByRow: {} });
+      res.json({
+        dataset: null,
+        rows: [],
+        remarksByRow: {},
+        totalFiltered: 0,
+        rowsWithRemarksCount: 0,
+        totalVisibleRemarks: 0,
+        page: 1,
+        pageSize: 25,
+      });
       return;
     }
-    const rows = getDatasetRows(dataset.id);
-    const visibleRemarks = getVisibleRemarksForDataset(dataset.id, req.currentUser!);
-    const remarksByRow: Record<string, typeof visibleRemarks> = {};
-    for (const r of visibleRemarks) {
-      const key = String(r.rowId);
-      if (!remarksByRow[key]) remarksByRow[key] = [];
-      remarksByRow[key].push(r);
-    }
+
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const column = typeof req.query.column === 'string' ? req.query.column : '__ALL__';
+    const value = typeof req.query.value === 'string' ? req.query.value : '__ALL__';
+    const rawFilter = typeof req.query.remarkFilter === 'string' ? req.query.remarkFilter : 'all';
+    const remarkFilter =
+      rawFilter === 'with_remarks' || rawFilter === 'without_remarks' ? rawFilter : 'all';
+    const page = Number(req.query.page) || 1;
+    const pageSize = Number(req.query.pageSize) || 25;
+
+    const result = queryDatasetRows({
+      dataset,
+      user: req.currentUser!,
+      q,
+      column,
+      value,
+      remarkFilter,
+      page,
+      pageSize,
+    });
+
     res.json({
       dataset,
-      rows,
-      remarksByRow,
-      totalVisibleRemarks: visibleRemarks.length,
+      ...result,
     });
   });
 
-  app.post('/api/dataset/upload', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+  app.get('/api/dataset/column-values', requireAuth, (req: AuthedRequest, res: Response) => {
+    const dataset = getActiveDataset();
+    const column = typeof req.query.column === 'string' ? req.query.column : '';
+    if (!dataset || !column || !dataset.headers.includes(column)) {
+      res.json({ values: [] });
+      return;
+    }
+    const values = getDistinctColumnValues(dataset, column);
+    res.json({ values });
+  });
+
+  // --- Chunked Streaming File Upload Routes (Supports up to 10 GB) ---
+
+  app.post('/api/dataset/upload/init', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+    purgeExpiredUploadSessions();
     try {
-      const { fileName, fileBase64 } = req.body ?? {};
-      if (typeof fileName !== 'string' || typeof fileBase64 !== 'string' || !fileName.trim() || !fileBase64) {
+      const { fileName, fileSize } = req.body ?? {};
+      if (typeof fileName !== 'string' || !fileName.trim()) {
         res.status(400).json({ error: 'कृपया एक वैध Excel या CSV फ़ाइल चुनें।' });
         return;
       }
@@ -351,18 +447,122 @@ async function startServer(): Promise<void> {
         res.status(400).json({ error: 'केवल .xlsx, .xls या .csv फ़ाइल ही अपलोड की जा सकती है।' });
         return;
       }
-      const buffer = Buffer.from(fileBase64, 'base64');
-      if (buffer.length === 0 || buffer.length > MAX_UPLOAD_BYTES) {
-        res.status(400).json({ error: 'फ़ाइल का आकार 10 MB से कम होना चाहिए।' });
+      const sizeNum = Number(fileSize);
+      if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+        res.status(400).json({ error: 'फ़ाइल का आकार अमान्य है या फ़ाइल खाली है।' });
         return;
       }
-      const parsed = await parseUploadedSpreadsheet(buffer, cleanName);
-      const saved = saveNewDataset(cleanName, parsed.headers, parsed.rows, req.currentUser!);
+      if (sizeNum > MAX_UPLOAD_BYTES) {
+        res.status(413).json({ error: 'फ़ाइल का आकार अधिकतम 10 GB तक हो सकता है।' });
+        return;
+      }
+
+      const uploadId = crypto.randomUUID();
+      const tempFilePath = resolveTempUploadPath(uploadId);
+      await fs.promises.writeFile(tempFilePath, Buffer.alloc(0));
+
+      uploadSessions.set(uploadId, {
+        id: uploadId,
+        userId: req.currentUser!.id,
+        fileName: cleanName,
+        expectedSize: sizeNum,
+        receivedBytes: 0,
+        tempFilePath,
+        createdAt: Date.now(),
+      });
+
+      res.status(201).json({
+        uploadId,
+        chunkSize: CHUNK_SIZE_BYTES,
+        maxBytes: MAX_UPLOAD_BYTES,
+      });
+    } catch {
+      res.status(500).json({ error: 'अपलोड शुरू करने में त्रुटि हुई।' });
+    }
+  });
+
+  app.put(
+    '/api/dataset/upload/chunk/:uploadId',
+    requireAuth,
+    requireAdmin,
+    express.raw({ type: 'application/octet-stream', limit: '8mb' }),
+    async (req: AuthedRequest, res: Response) => {
+      const { uploadId } = req.params;
+      if (!UUID_REGEX.test(uploadId)) {
+        res.status(400).json({ error: 'अमान्य अपलोड आईडी।' });
+        return;
+      }
+      const session = uploadSessions.get(uploadId);
+      if (!session || session.userId !== req.currentUser!.id) {
+        res.status(404).json({ error: 'अपलोड सेशन नहीं मिला या समाप्त हो गया है।' });
+        return;
+      }
+
+      const chunk = req.body;
+      if (!Buffer.isBuffer(chunk) || chunk.length === 0) {
+        res.status(400).json({ error: 'फ़ाइल चंक खाली है।' });
+        return;
+      }
+      if (session.receivedBytes + chunk.length > MAX_UPLOAD_BYTES) {
+        await cleanupUploadSession(uploadId);
+        res.status(413).json({ error: 'फ़ाइल का आकार 10 GB की सीमा से अधिक है।' });
+        return;
+      }
+
+      try {
+        await fs.promises.appendFile(session.tempFilePath, chunk);
+        session.receivedBytes += chunk.length;
+        res.json({
+          receivedBytes: session.receivedBytes,
+          expectedSize: session.expectedSize,
+        });
+      } catch (err) {
+        await cleanupUploadSession(uploadId);
+        const msg =
+          err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOSPC'
+            ? 'सर्वर डिस्क में पर्याप्त खाली स्थान नहीं है।'
+            : 'फ़ाइल चंक सेव करने में त्रुटि हुई।';
+        res.status(500).json({ error: msg });
+      }
+    }
+  );
+
+  app.post('/api/dataset/upload/complete/:uploadId', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+    const { uploadId } = req.params;
+    if (!UUID_REGEX.test(uploadId)) {
+      res.status(400).json({ error: 'अमान्य अपलोड आईडी।' });
+      return;
+    }
+    const session = uploadSessions.get(uploadId);
+    if (!session || session.userId !== req.currentUser!.id) {
+      res.status(404).json({ error: 'अपलोड सेशन नहीं मिला।' });
+      return;
+    }
+
+    try {
+      const saved = await streamImportSpreadsheetFromFile(
+        session.tempFilePath,
+        session.fileName,
+        req.currentUser!
+      );
       res.status(201).json({ dataset: saved });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'फ़ाइल प्रोसेस करने में त्रुटि हुई।';
       res.status(400).json({ error: msg });
+    } finally {
+      await cleanupUploadSession(uploadId);
     }
+  });
+
+  app.delete('/api/dataset/upload/:uploadId', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+    const { uploadId } = req.params;
+    if (UUID_REGEX.test(uploadId)) {
+      const session = uploadSessions.get(uploadId);
+      if (session && session.userId === req.currentUser!.id) {
+        await cleanupUploadSession(uploadId);
+      }
+    }
+    res.json({ ok: true });
   });
 
   app.post('/api/dataset/load-sample', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
@@ -400,15 +600,9 @@ async function startServer(): Promise<void> {
         res.status(404).json({ error: 'डाउनलोड के लिए कोई Excel डाटा उपलब्ध नहीं है।' });
         return;
       }
-      const rows = getDatasetRows(dataset.id);
-      const remarks = getAllRemarksForDatasetAdmin(dataset.id);
-      const buffer = await buildExportWorkbookBuffer({
-        headers: dataset.headers,
-        rows,
-        remarks,
-      });
-
+      const remarksByRow = getAllRemarksByRowAdmin(dataset.id);
       const baseSafeName = dataset.fileName.replace(/\.[^.]+$/, '').replace(/[^\w\s-]/g, '') || 'data';
+
       res.setHeader(
         'Content-Type',
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -417,9 +611,17 @@ async function startServer(): Promise<void> {
         'Content-Disposition',
         `attachment; filename="${baseSafeName}_with_remarks.xlsx"`
       );
-      res.send(buffer);
+
+      await streamExportWorkbookToResponse({
+        stream: res,
+        headers: dataset.headers,
+        rowsIterator: iterateDatasetRows(dataset.id),
+        remarksByRow,
+      });
     } catch {
-      res.status(500).json({ error: 'Excel डाउनलोड फ़ाइल तैयार करने में त्रुटि हुई।' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Excel डाउनलोड फ़ाइल तैयार करने में त्रुटि हुई।' });
+      }
     }
   });
 
@@ -520,9 +722,12 @@ async function startServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
+  // Allow long-running streaming complete/export requests for very large files
+  server.requestTimeout = 0;
+  server.headersTimeout = 120_000;
 }
 
 startServer().catch((err) => {

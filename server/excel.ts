@@ -1,13 +1,21 @@
 import ExcelJS from 'exceljs';
-import type { DatasetRowRecord, RemarkRecord, UserRole } from './db.ts';
+import fs from 'node:fs';
+import type { Writable } from 'node:stream';
+import {
+  abortStagedDataset,
+  beginStagedDataset,
+  finalizeStagedDataset,
+  insertDatasetRowsBatch,
+} from './db.ts';
+import type { DatasetInfo, DatasetRowRecord, RemarkRecord, SafeUser, UserRole } from './db.ts';
 
 export interface ParsedSpreadsheet {
   headers: string[];
   rows: Array<Record<string, string>>;
 }
 
-const MAX_ROWS = 15000;
-const MAX_COLS = 80;
+const MAX_COLS = 100;
+const BATCH_SIZE = 1000;
 
 const ROLE_LABELS_HI: Record<UserRole, string> = {
   admin: 'Admin',
@@ -49,7 +57,6 @@ function cellValueToString(val: ExcelJS.CellValue): string {
 
 function normalizeHeaders(rawHeaders: string[]): string[] {
   const trimmed = rawHeaders.slice(0, MAX_COLS);
-  // Trim trailing completely empty columns
   while (trimmed.length > 0 && !trimmed[trimmed.length - 1]) {
     trimmed.pop();
   }
@@ -62,58 +69,11 @@ function normalizeHeaders(rawHeaders: string[]): string[] {
   });
 }
 
-function parseCsvText(text: string): string[][] {
-  const clean = text.replace(/^\uFEFF/, '');
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = '';
-  let inQuotes = false;
-
-  // Detect delimiter from first line (comma or tab or semicolon)
-  const firstLine = clean.split(/\r?\n/, 1)[0] ?? '';
-  const commaCount = (firstLine.match(/,/g) ?? []).length;
-  const tabCount = (firstLine.match(/\t/g) ?? []).length;
-  const semiCount = (firstLine.match(/;/g) ?? []).length;
-  const delimiter = tabCount > commaCount && tabCount >= semiCount ? '\t' : semiCount > commaCount ? ';' : ',';
-
-  for (let i = 0; i < clean.length; i += 1) {
-    const ch = clean[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        if (clean[i + 1] === '"') {
-          field += '"';
-          i += 1;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        field += ch;
-      }
-    } else if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === delimiter) {
-      row.push(field.trim());
-      field = '';
-    } else if (ch === '\r') {
-      if (clean[i + 1] === '\n') i += 1;
-      row.push(field.trim());
-      rows.push(row);
-      row = [];
-      field = '';
-    } else if (ch === '\n') {
-      row.push(field.trim());
-      rows.push(row);
-      row = [];
-      field = '';
-    } else {
-      field += ch;
-    }
-  }
-  if (field.length > 0 || row.length > 0) {
-    row.push(field.trim());
-    rows.push(row);
-  }
-  return rows.filter((r) => r.some((cell) => cell.trim() !== ''));
+function detectDelimiter(sampleLine: string): string {
+  const commaCount = (sampleLine.match(/,/g) ?? []).length;
+  const tabCount = (sampleLine.match(/\t/g) ?? []).length;
+  const semiCount = (sampleLine.match(/;/g) ?? []).length;
+  return tabCount > commaCount && tabCount >= semiCount ? '\t' : semiCount > commaCount ? ';' : ',';
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -129,7 +89,6 @@ function decodeHtmlEntities(input: string): string {
 }
 
 function parseHtmlOrXmlXls(text: string): string[][] | null {
-  // Handle Excel 2003 XML SpreadsheetML (<Row><Cell><Data>...)
   if (/<Row[\s>]/i.test(text) && /<Data[\s>]/i.test(text)) {
     const rowMatches = text.match(/<Row\b[^>]*>[\s\S]*?<\/Row>/gi);
     if (!rowMatches) return null;
@@ -151,7 +110,6 @@ function parseHtmlOrXmlXls(text: string): string[][] | null {
     return matrix.length > 0 ? matrix : null;
   }
 
-  // Handle HTML table exported as .xls (very common from utility portals)
   if (/<tr[\s>]/i.test(text) && /<t[hd][\s>]/i.test(text)) {
     const rowMatches = text.match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi);
     if (!rowMatches) return null;
@@ -169,88 +127,314 @@ function parseHtmlOrXmlXls(text: string): string[][] | null {
   return null;
 }
 
-function matrixToParsed(matrix: string[][]): ParsedSpreadsheet {
-  if (matrix.length === 0) {
-    throw new Error('फ़ाइल खाली है या कोई वैध पंक्ति नहीं मिली।');
+/**
+ * Streams a CSV/TSV file from disk without loading it into memory,
+ * inserting rows in batches of 1,000 inside SQLite transactions.
+ */
+async function streamImportCsvFromFile(
+  filePath: string,
+  fileName: string,
+  uploadedBy: SafeUser
+): Promise<DatasetInfo> {
+  // Peek first 8 KB to detect delimiter
+  const fh = await fs.promises.open(filePath, 'r');
+  let delimiter = ',';
+  try {
+    const peekBuf = Buffer.alloc(8192);
+    const { bytesRead } = await fh.read(peekBuf, 0, 8192, 0);
+    const firstLine = peekBuf
+      .subarray(0, bytesRead)
+      .toString('utf8')
+      .replace(/^\uFEFF/, '')
+      .split(/\r?\n/, 1)[0] ?? '';
+    delimiter = detectDelimiter(firstLine);
+  } finally {
+    await fh.close();
   }
-  const headers = normalizeHeaders(matrix[0]);
-  if (headers.length === 0) {
-    throw new Error('पहली पंक्ति में कोई कॉलम हेडर नहीं मिला।');
-  }
-  const dataRows: Array<Record<string, string>> = [];
-  const limit = Math.min(matrix.length, MAX_ROWS + 1);
-  for (let r = 1; r < limit; r += 1) {
-    const rawRow = matrix[r];
+
+  let datasetId: number | null = null;
+  let headers: string[] = [];
+  let totalRows = 0;
+  let batch: Array<Record<string, string>> = [];
+
+  let currentRow: string[] = [];
+  let field = '';
+  let inQuotes = false;
+  let pendingQuote = false;
+  let isFirstChunk = true;
+
+  const flushBatch = () => {
+    if (datasetId === null || batch.length === 0) return;
+    const startIdx = totalRows - batch.length + 1;
+    insertDatasetRowsBatch(datasetId, startIdx, headers, batch);
+    batch = [];
+  };
+
+  const commitRow = (cells: string[]) => {
+    if (!cells.some((c) => c.trim() !== '')) return;
+    if (datasetId === null) {
+      headers = normalizeHeaders(cells);
+      if (headers.length === 0) {
+        throw new Error('पहली पंक्ति में कोई कॉलम हेडर नहीं मिला।');
+      }
+      datasetId = beginStagedDataset(fileName, headers, uploadedBy);
+      return;
+    }
+
     const obj: Record<string, string> = {};
-    let hasAnyValue = false;
+    let hasValue = false;
     for (let c = 0; c < headers.length; c += 1) {
-      const val = (rawRow[c] ?? '').trim();
+      const val = (cells[c] ?? '').trim();
       obj[headers[c]] = val;
-      if (val !== '') hasAnyValue = true;
+      if (val !== '') hasValue = true;
     }
-    if (hasAnyValue) {
-      dataRows.push(obj);
+    if (!hasValue) return;
+    totalRows += 1;
+    batch.push(obj);
+    if (batch.length >= BATCH_SIZE) {
+      flushBatch();
     }
+  };
+
+  try {
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 256 * 1024 });
+    for await (const rawChunk of stream) {
+      const chunk = isFirstChunk ? (rawChunk as string).replace(/^\uFEFF/, '') : (rawChunk as string);
+      isFirstChunk = false;
+
+      for (let i = 0; i < chunk.length; i += 1) {
+        const ch = chunk[i];
+
+        if (pendingQuote) {
+          pendingQuote = false;
+          if (ch === '"') {
+            field += '"';
+            continue;
+          }
+          inQuotes = false;
+          // fall through to process current ch outside quotes
+        }
+
+        if (inQuotes) {
+          if (ch === '"') {
+            pendingQuote = true;
+          } else {
+            field += ch;
+          }
+        } else if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === delimiter) {
+          currentRow.push(field.trim());
+          field = '';
+        } else if (ch === '\r') {
+          currentRow.push(field.trim());
+          commitRow(currentRow);
+          currentRow = [];
+          field = '';
+        } else if (ch === '\n') {
+          if (field.length > 0 || currentRow.length > 0) {
+            currentRow.push(field.trim());
+            commitRow(currentRow);
+            currentRow = [];
+            field = '';
+          }
+        } else {
+          field += ch;
+        }
+      }
+    }
+
+    if (field.length > 0 || currentRow.length > 0) {
+      currentRow.push(field.trim());
+      commitRow(currentRow);
+    }
+
+    flushBatch();
+
+    if (datasetId === null || totalRows === 0) {
+      if (datasetId !== null) abortStagedDataset(datasetId);
+      throw new Error('हेडर पंक्ति के बाद कोई डाटा पंक्ति नहीं मिली।');
+    }
+
+    return finalizeStagedDataset(datasetId, totalRows);
+  } catch (err) {
+    if (datasetId !== null) abortStagedDataset(datasetId);
+    throw err;
   }
-  if (dataRows.length === 0) {
-    throw new Error('हेडर पंक्ति के बाद कोई डाटा पंक्ति नहीं मिली।');
-  }
-  return { headers, rows: dataRows };
 }
 
-export async function parseUploadedSpreadsheet(
-  buffer: Buffer,
-  fileName: string
-): Promise<ParsedSpreadsheet> {
+/**
+ * Streams an .xlsx file row-by-row from disk using ExcelJS WorkbookReader
+ * so multi-GB spreadsheets import cleanly without loading into RAM.
+ */
+async function streamImportXlsxFromFile(
+  filePath: string,
+  fileName: string,
+  uploadedBy: SafeUser
+): Promise<DatasetInfo> {
+  let datasetId: number | null = null;
+  let headers: string[] = [];
+  let totalRows = 0;
+  let batch: Array<Record<string, string>> = [];
+
+  const flushBatch = () => {
+    if (datasetId === null || batch.length === 0) return;
+    const startIdx = totalRows - batch.length + 1;
+    insertDatasetRowsBatch(datasetId, startIdx, headers, batch);
+    batch = [];
+  };
+
+  try {
+    const reader = new ExcelJS.stream.xlsx.WorkbookReader(filePath, {
+      entries: 'emit',
+      worksheets: 'emit',
+      sharedStrings: 'cache',
+      hyperlinks: 'ignore',
+      styles: 'ignore',
+    });
+
+    let processedFirstSheet = false;
+
+    for await (const worksheetReader of reader) {
+      if (processedFirstSheet) break;
+      processedFirstSheet = true;
+
+      for await (const row of worksheetReader) {
+        const colCount = Math.min(row.cellCount, MAX_COLS);
+        const cells: string[] = [];
+        for (let c = 1; c <= colCount; c += 1) {
+          cells.push(cellValueToString(row.getCell(c).value));
+        }
+        if (!cells.some((v) => v !== '')) continue;
+
+        if (datasetId === null) {
+          headers = normalizeHeaders(cells);
+          if (headers.length === 0) {
+            throw new Error('पहली पंक्ति में कोई कॉलम हेडर नहीं मिला।');
+          }
+          datasetId = beginStagedDataset(fileName, headers, uploadedBy);
+          continue;
+        }
+
+        const obj: Record<string, string> = {};
+        let hasValue = false;
+        for (let c = 0; c < headers.length; c += 1) {
+          const val = cells[c] ?? '';
+          obj[headers[c]] = val;
+          if (val !== '') hasValue = true;
+        }
+        if (!hasValue) continue;
+
+        totalRows += 1;
+        batch.push(obj);
+        if (batch.length >= BATCH_SIZE) {
+          flushBatch();
+        }
+      }
+    }
+
+    flushBatch();
+
+    if (datasetId === null || totalRows === 0) {
+      if (datasetId !== null) abortStagedDataset(datasetId);
+      throw new Error('Excel फ़ाइल में हेडर के बाद कोई डाटा पंक्ति नहीं मिली।');
+    }
+
+    return finalizeStagedDataset(datasetId, totalRows);
+  } catch (err) {
+    if (datasetId !== null) abortStagedDataset(datasetId);
+    throw err;
+  }
+}
+
+export async function streamImportSpreadsheetFromFile(
+  filePath: string,
+  fileName: string,
+  uploadedBy: SafeUser
+): Promise<DatasetInfo> {
   const lower = fileName.toLowerCase();
+
+  // Read magic header bytes from disk
+  const fh = await fs.promises.open(filePath, 'r');
+  const sig = Buffer.alloc(16);
+  let readLen = 0;
+  try {
+    const res = await fh.read(sig, 0, 16, 0);
+    readLen = res.bytesRead;
+  } finally {
+    await fh.close();
+  }
+
+  if (readLen === 0) {
+    throw new Error('अपलोड की गई फ़ाइल खाली है।');
+  }
+
   const isZipSignature =
-    buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04;
+    readLen >= 4 && sig[0] === 0x50 && sig[1] === 0x4b && sig[2] === 0x03 && sig[3] === 0x04;
   const isOleBinaryXls =
-    buffer.length >= 8 &&
-    buffer[0] === 0xd0 &&
-    buffer[1] === 0xcf &&
-    buffer[2] === 0x11 &&
-    buffer[3] === 0xe0;
+    readLen >= 8 &&
+    sig[0] === 0xd0 &&
+    sig[1] === 0xcf &&
+    sig[2] === 0x11 &&
+    sig[3] === 0xe0;
 
   if (lower.endsWith('.csv')) {
-    const text = buffer.toString('utf8');
-    return matrixToParsed(parseCsvText(text));
+    return streamImportCsvFromFile(filePath, fileName, uploadedBy);
   }
 
   if (lower.endsWith('.xlsx') || isZipSignature) {
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer as unknown as ArrayBuffer);
-    const sheet = workbook.worksheets[0];
-    if (!sheet) {
-      throw new Error('Excel फ़ाइल में कोई वर्कशीट नहीं मिली।');
-    }
-    const matrix: string[][] = [];
-    sheet.eachRow({ includeEmpty: false }, (row) => {
-      const rowValues: string[] = [];
-      const colCount = Math.min(row.cellCount, MAX_COLS);
-      for (let c = 1; c <= colCount; c += 1) {
-        rowValues.push(cellValueToString(row.getCell(c).value));
-      }
-      if (rowValues.some((v) => v !== '')) {
-        matrix.push(rowValues);
-      }
-    });
-    return matrixToParsed(matrix);
+    return streamImportXlsxFromFile(filePath, fileName, uploadedBy);
   }
 
   if (lower.endsWith('.xls')) {
-    if (!isOleBinaryXls) {
-      // Many portal .xls exports are SpreadsheetML XML, HTML tables, or TSV/CSV text
-      const text = buffer.toString('utf8');
-      const xmlOrHtml = parseHtmlOrXmlXls(text);
-      if (xmlOrHtml) {
-        return matrixToParsed(xmlOrHtml);
-      }
-      return matrixToParsed(parseCsvText(text));
+    if (isOleBinaryXls) {
+      throw new Error(
+        'यह पुराना बाइनरी .xls (Excel 97-2003) फ़ॉर्मेट है। कृपया इसे Excel में खोलकर .xlsx या .csv फ़ॉर्मेट में Save As करके अपलोड करें।'
+      );
     }
-    throw new Error(
-      'यह पुराना बाइनरी .xls (Excel 97-2003) फ़ॉर्मेट है। कृपया इसे Excel में खोलकर .xlsx या .csv फ़ॉर्मेट में Save As करके अपलोड करें।'
-    );
+    const stat = await fs.promises.stat(filePath);
+    // Check if XML/HTML table .xls (reasonable text size) or TSV/CSV text
+    if (stat.size <= 50 * 1024 * 1024) {
+      const text = await fs.promises.readFile(filePath, 'utf8');
+      const matrix = parseHtmlOrXmlXls(text);
+      if (matrix && matrix.length > 1) {
+        const headers = normalizeHeaders(matrix[0]);
+        const datasetId = beginStagedDataset(fileName, headers, uploadedBy);
+        try {
+          let totalRows = 0;
+          let batch: Array<Record<string, string>> = [];
+          for (let r = 1; r < matrix.length; r += 1) {
+            const rawRow = matrix[r];
+            const obj: Record<string, string> = {};
+            let hasVal = false;
+            for (let c = 0; c < headers.length; c += 1) {
+              const val = (rawRow[c] ?? '').trim();
+              obj[headers[c]] = val;
+              if (val !== '') hasVal = true;
+            }
+            if (!hasVal) continue;
+            totalRows += 1;
+            batch.push(obj);
+            if (batch.length >= BATCH_SIZE) {
+              insertDatasetRowsBatch(datasetId, totalRows - batch.length + 1, headers, batch);
+              batch = [];
+            }
+          }
+          if (batch.length > 0) {
+            insertDatasetRowsBatch(datasetId, totalRows - batch.length + 1, headers, batch);
+          }
+          if (totalRows === 0) {
+            abortStagedDataset(datasetId);
+            throw new Error('हेडर पंक्ति के बाद कोई डाटा पंक्ति नहीं मिली।');
+          }
+          return finalizeStagedDataset(datasetId, totalRows);
+        } catch (err) {
+          abortStagedDataset(datasetId);
+          throw err;
+        }
+      }
+    }
+    return streamImportCsvFromFile(filePath, fileName, uploadedBy);
   }
 
   throw new Error('कृपया केवल .xlsx, .xls या .csv फ़ाइल ही अपलोड करें।');
@@ -272,21 +456,24 @@ function formatDateTimeIST(isoString: string): string {
   }
 }
 
-export async function buildExportWorkbookBuffer(params: {
+/**
+ * Streams an .xlsx export directly to an HTTP response stream so even very large
+ * datasets with remarks export cleanly with low memory usage.
+ */
+export async function streamExportWorkbookToResponse(params: {
+  stream: Writable;
   headers: string[];
-  rows: DatasetRowRecord[];
-  remarks: RemarkRecord[];
-}): Promise<Buffer> {
-  const { headers, rows, remarks } = params;
-  const remarksByRow = new Map<number, RemarkRecord[]>();
-  for (const r of remarks) {
-    const list = remarksByRow.get(r.rowId) ?? [];
-    list.push(r);
-    remarksByRow.set(r.rowId, list);
-  }
+  rowsIterator: Iterable<DatasetRowRecord>;
+  remarksByRow: Map<number, RemarkRecord[]>;
+}): Promise<void> {
+  const { stream, headers, rowsIterator, remarksByRow } = params;
 
-  const workbook = new ExcelJS.Workbook();
-  workbook.creator = 'डाटा रिमार्क पोर्टल';
+  const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
+    stream,
+    useStyles: true,
+    useSharedStrings: false,
+  });
+  workbook.creator = 'PuVVNL डाटा रिमार्क पोर्टल';
   workbook.created = new Date();
 
   const sheet = workbook.addWorksheet('डाटा और रिमार्क', {
@@ -302,7 +489,18 @@ export async function buildExportWorkbookBuffer(params: {
     'सभी रिमार्क इतिहास',
   ];
 
-  const headerRow = sheet.addRow(exportHeaders);
+  sheet.columns = exportHeaders.map((h, idx) => ({
+    header: h,
+    key: `c_${idx}`,
+    width:
+      idx === exportHeaders.length - 1
+        ? 48
+        : idx >= headers.length
+        ? 24
+        : Math.max(15, Math.min(30, h.length + 6)),
+  }));
+
+  const headerRow = sheet.getRow(1);
   headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
   headerRow.fill = {
     type: 'pattern',
@@ -311,8 +509,9 @@ export async function buildExportWorkbookBuffer(params: {
   };
   headerRow.alignment = { vertical: 'middle', horizontal: 'left', wrapText: true };
   headerRow.height = 28;
+  headerRow.commit();
 
-  for (const row of rows) {
+  for (const row of rowsIterator) {
     const rowRemarks = remarksByRow.get(row.id) ?? [];
     const latest = rowRemarks[0];
     const historyText = rowRemarks
@@ -333,27 +532,11 @@ export async function buildExportWorkbookBuffer(params: {
 
     const added = sheet.addRow(values);
     added.alignment = { vertical: 'top', wrapText: true };
+    added.commit();
   }
 
-  // Set readable column widths
-  exportHeaders.forEach((h, idx) => {
-    const col = sheet.getColumn(idx + 1);
-    if (idx === exportHeaders.length - 1) {
-      col.width = 48;
-    } else if (idx >= headers.length) {
-      col.width = 24;
-    } else {
-      col.width = Math.max(15, Math.min(30, h.length + 6));
-    }
-  });
-
-  sheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: 1, column: exportHeaders.length },
-  };
-
-  const arrayBuf = await workbook.xlsx.writeBuffer();
-  return Buffer.from(arrayBuf);
+  await sheet.commit();
+  await workbook.commit();
 }
 
 export const SAMPLE_UTILITY_DATA: ParsedSpreadsheet = {

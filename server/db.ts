@@ -53,6 +53,27 @@ export interface RemarkRecord {
   updatedAt: string;
 }
 
+export interface DatasetQueryParams {
+  dataset: DatasetInfo;
+  user: SafeUser;
+  q: string;
+  column: string;
+  value: string;
+  remarkFilter: 'all' | 'with_remarks' | 'without_remarks';
+  page: number;
+  pageSize: number;
+}
+
+export interface DatasetQueryResult {
+  rows: DatasetRowRecord[];
+  remarksByRow: Record<string, RemarkRecord[]>;
+  totalFiltered: number;
+  rowsWithRemarksCount: number;
+  totalVisibleRemarks: number;
+  page: number;
+  pageSize: number;
+}
+
 const VALID_ROLES = new Set<UserRole>(['admin', 'je', 'supervisor', 'lineman']);
 
 export function isValidRole(value: unknown): value is UserRole {
@@ -65,6 +86,7 @@ const dbPath = path.resolve(dataDir, 'portal.db');
 
 export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
 db.pragma('foreign_keys = ON');
 
 db.exec(`
@@ -287,7 +309,6 @@ export function authenticateUser(usernameInput: string, passwordInput: string): 
     if (!timingSafeStringCompare(passwordInput, envAdmin.password)) {
       return null;
     }
-    // Ensure a matching DB record exists for the env-configured admin
     const existing = db
       .prepare('SELECT id FROM users WHERE lower(username) = ?')
       .get(normalizedUsername) as { id: number } | undefined;
@@ -318,8 +339,7 @@ export function createSession(userId: number): string {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   const now = new Date();
-  const expires = new Date(now.getTime() + 1000 * 60 * 60 * 24 * 7); // 7 days
-  // Cleanup expired sessions occasionally
+  const expires = new Date(now.getTime() + 1000 * 60 * 60 * 24 * 7);
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now.toISOString());
   db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').run(
     tokenHash,
@@ -464,47 +484,73 @@ export function deleteUserAccount(targetId: number, actorId: number): void {
   db.prepare('DELETE FROM users WHERE id = ?').run(targetId);
 }
 
-const replaceActiveDatasetTxn = db.transaction(
+// --- Streaming / Staged Dataset Import Helpers (supports huge files up to 10 GB) ---
+
+const insertDatasetRowStmt = db.prepare(
+  `INSERT INTO dataset_rows (dataset_id, row_index, data_json, search_text)
+   VALUES (?, ?, ?, ?)`
+);
+
+const insertRowBatchTxn = db.transaction(
   (
-    fileName: string,
+    datasetId: number,
+    startRowIndex: number,
     headers: string[],
-    rows: Array<Record<string, string>>,
-    uploadedBy: SafeUser
-  ): DatasetInfo => {
-    db.prepare('UPDATE datasets SET is_active = 0 WHERE is_active = 1').run();
-    const now = new Date().toISOString();
-    const dsInfo = db
-      .prepare(
-        `INSERT INTO datasets (file_name, headers_json, row_count, uploaded_by_id, uploaded_by_name, uploaded_at, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, 1)`
-      )
-      .run(fileName, JSON.stringify(headers), rows.length, uploadedBy.id, uploadedBy.fullName, now);
-
-    const datasetId = Number(dsInfo.lastInsertRowid);
-    const insertRow = db.prepare(
-      `INSERT INTO dataset_rows (dataset_id, row_index, data_json, search_text)
-       VALUES (?, ?, ?, ?)`
-    );
-
-    for (let i = 0; i < rows.length; i += 1) {
-      const rowData = rows[i];
+    batch: Array<Record<string, string>>
+  ) => {
+    for (let i = 0; i < batch.length; i += 1) {
+      const rowData = batch[i];
       const searchText = headers
         .map((h) => rowData[h] ?? '')
         .join(' ')
         .toLowerCase();
-      insertRow.run(datasetId, i + 1, JSON.stringify(rowData), searchText);
+      insertDatasetRowStmt.run(datasetId, startRowIndex + i, JSON.stringify(rowData), searchText);
     }
-
-    return {
-      id: datasetId,
-      fileName,
-      headers,
-      rowCount: rows.length,
-      uploadedByName: uploadedBy.fullName,
-      uploadedAt: now,
-    };
   }
 );
+
+export function beginStagedDataset(
+  fileName: string,
+  headers: string[],
+  uploadedBy: SafeUser
+): number {
+  const now = new Date().toISOString();
+  const info = db
+    .prepare(
+      `INSERT INTO datasets (file_name, headers_json, row_count, uploaded_by_id, uploaded_by_name, uploaded_at, is_active)
+       VALUES (?, ?, 0, ?, ?, ?, 0)`
+    )
+    .run(fileName, JSON.stringify(headers), uploadedBy.id, uploadedBy.fullName, now);
+  return Number(info.lastInsertRowid);
+}
+
+export function insertDatasetRowsBatch(
+  datasetId: number,
+  startRowIndex: number,
+  headers: string[],
+  batch: Array<Record<string, string>>
+): void {
+  if (batch.length === 0) return;
+  insertRowBatchTxn(datasetId, startRowIndex, headers, batch);
+}
+
+const activateDatasetTxn = db.transaction((datasetId: number, rowCount: number): DatasetInfo => {
+  db.prepare('UPDATE datasets SET is_active = 0 WHERE is_active = 1').run();
+  db.prepare('UPDATE datasets SET is_active = 1, row_count = ? WHERE id = ?').run(rowCount, datasetId);
+  const ds = getActiveDataset();
+  if (!ds || ds.id !== datasetId) {
+    throw new Error('FAILED_TO_ACTIVATE_DATASET');
+  }
+  return ds;
+});
+
+export function finalizeStagedDataset(datasetId: number, rowCount: number): DatasetInfo {
+  return activateDatasetTxn(datasetId, rowCount);
+}
+
+export function abortStagedDataset(datasetId: number): void {
+  db.prepare('DELETE FROM datasets WHERE id = ? AND is_active = 0').run(datasetId);
+}
 
 export function saveNewDataset(
   fileName: string,
@@ -512,7 +558,17 @@ export function saveNewDataset(
   rows: Array<Record<string, string>>,
   uploadedBy: SafeUser
 ): DatasetInfo {
-  return replaceActiveDatasetTxn(fileName, headers, rows, uploadedBy);
+  const datasetId = beginStagedDataset(fileName, headers, uploadedBy);
+  try {
+    const BATCH_SIZE = 1000;
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      insertDatasetRowsBatch(datasetId, i + 1, headers, rows.slice(i, i + BATCH_SIZE));
+    }
+    return finalizeStagedDataset(datasetId, rows.length);
+  } catch (err) {
+    abortStagedDataset(datasetId);
+    throw err;
+  }
 }
 
 export function getActiveDataset(): DatasetInfo | null {
@@ -553,22 +609,19 @@ export function getActiveDataset(): DatasetInfo | null {
   };
 }
 
-export function getDatasetRows(datasetId: number): DatasetRowRecord[] {
-  const rows = db
-    .prepare(
-      `SELECT id, dataset_id, row_index, data_json
-       FROM dataset_rows
-       WHERE dataset_id = ?
-       ORDER BY row_index ASC`
-    )
-    .all(datasetId) as Array<{
+export function* iterateDatasetRows(datasetId: number): Generator<DatasetRowRecord> {
+  const stmt = db.prepare(
+    `SELECT id, dataset_id, row_index, data_json
+     FROM dataset_rows
+     WHERE dataset_id = ?
+     ORDER BY row_index ASC`
+  );
+  for (const r of stmt.iterate(datasetId) as Iterable<{
     id: number;
     dataset_id: number;
     row_index: number;
     data_json: string;
-  }>;
-
-  return rows.map((r) => {
+  }>) {
     let data: Record<string, string> = {};
     try {
       const parsed = JSON.parse(r.data_json);
@@ -576,13 +629,13 @@ export function getDatasetRows(datasetId: number): DatasetRowRecord[] {
     } catch {
       data = {};
     }
-    return {
+    yield {
       id: r.id,
       datasetId: r.dataset_id,
       rowIndex: r.row_index,
       data,
     };
-  });
+  }
 }
 
 export function getDatasetRowById(rowId: number): DatasetRowRecord | null {
@@ -630,84 +683,189 @@ function mapRemark(r: {
   };
 }
 
-/**
- * Enforces strict server-side role visibility for remarks:
- * - Admin & JE: all remarks
- * - Supervisor: own remarks + remarks of linemen assigned to them
- * - Lineman: own remarks only
- */
-export function getVisibleRemarksForDataset(datasetId: number, user: SafeUser): RemarkRecord[] {
+function buildVisibleRemarksFilterSql(
+  datasetId: number,
+  user: SafeUser,
+  tableAlias = 'rem'
+): { clause: string; params: Array<number | string> } {
   if (user.role === 'admin' || user.role === 'je') {
-    const rows = db
-      .prepare(
-        `SELECT id, dataset_id, row_id, user_id, user_name, user_role, comment, created_at, updated_at
-         FROM remarks
-         WHERE dataset_id = ?
-         ORDER BY created_at DESC, id DESC`
-      )
-      .all(datasetId) as Array<{
-      id: number;
-      dataset_id: number;
-      row_id: number;
-      user_id: number | null;
-      user_name: string;
-      user_role: UserRole;
-      comment: string;
-      created_at: string;
-      updated_at: string;
-    }>;
-    return rows.map(mapRemark);
+    return { clause: `${tableAlias}.dataset_id = ?`, params: [datasetId] };
   }
-
   if (user.role === 'supervisor') {
-    const rows = db
-      .prepare(
-        `SELECT r.id, r.dataset_id, r.row_id, r.user_id, r.user_name, r.user_role, r.comment, r.created_at, r.updated_at
-         FROM remarks r
-         WHERE r.dataset_id = ?
-           AND (
-             r.user_id = ?
-             OR r.user_id IN (SELECT id FROM users WHERE role = 'lineman' AND supervisor_id = ?)
-           )
-         ORDER BY r.created_at DESC, r.id DESC`
-      )
-      .all(datasetId, user.id, user.id) as Array<{
-      id: number;
-      dataset_id: number;
-      row_id: number;
-      user_id: number | null;
-      user_name: string;
-      user_role: UserRole;
-      comment: string;
-      created_at: string;
-      updated_at: string;
-    }>;
-    return rows.map(mapRemark);
+    return {
+      clause: `${tableAlias}.dataset_id = ? AND (${tableAlias}.user_id = ? OR ${tableAlias}.user_id IN (SELECT id FROM users WHERE role = 'lineman' AND supervisor_id = ?))`,
+      params: [datasetId, user.id, user.id],
+    };
   }
-
-  // Lineman: strictly own remarks
-  const rows = db
-    .prepare(
-      `SELECT id, dataset_id, row_id, user_id, user_name, user_role, comment, created_at, updated_at
-       FROM remarks
-       WHERE dataset_id = ? AND user_id = ?
-       ORDER BY created_at DESC, id DESC`
-    )
-    .all(datasetId, user.id) as Array<{
-    id: number;
-    dataset_id: number;
-    row_id: number;
-    user_id: number | null;
-    user_name: string;
-    user_role: UserRole;
-    comment: string;
-    created_at: string;
-    updated_at: string;
-  }>;
-  return rows.map(mapRemark);
+  return {
+    clause: `${tableAlias}.dataset_id = ? AND ${tableAlias}.user_id = ?`,
+    params: [datasetId, user.id],
+  };
 }
 
-export function getAllRemarksForDatasetAdmin(datasetId: number): RemarkRecord[] {
+function buildJsonPathForHeader(header: string): string {
+  // SQLite JSON1 supports $."escaped header"
+  const escaped = header.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `$."${escaped}"`;
+}
+
+export function getDistinctColumnValues(dataset: DatasetInfo, column: string): string[] {
+  if (!dataset.headers.includes(column)) return [];
+  const jsonPath = buildJsonPathForHeader(column);
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT trim(COALESCE(json_extract(data_json, ?), '')) AS val
+       FROM dataset_rows
+       WHERE dataset_id = ?
+         AND trim(COALESCE(json_extract(data_json, ?), '')) != ''
+       ORDER BY val COLLATE NOCASE ASC
+       LIMIT 250`
+    )
+    .all(jsonPath, dataset.id, jsonPath) as Array<{ val: string }>;
+  return rows.map((r) => r.val);
+}
+
+/**
+ * Server-side paginated search & column filtering for datasets of any size (up to 10 GB imports).
+ * Strictly enforces role-based remark visibility on the server.
+ */
+export function queryDatasetRows(params: DatasetQueryParams): DatasetQueryResult {
+  const { dataset, user, q, column, value, remarkFilter } = params;
+  const pageSize = Math.min(Math.max(10, params.pageSize), 200);
+  const requestedPage = Math.max(1, params.page);
+
+  const validColumn = column !== '__ALL__' && dataset.headers.includes(column) ? column : '__ALL__';
+  const jsonPath = validColumn !== '__ALL__' ? buildJsonPathForHeader(validColumn) : null;
+
+  const visRem = buildVisibleRemarksFilterSql(dataset.id, user, 'rem');
+
+  // Overall visible remark metrics for this dataset
+  const statsRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total_remarks, COUNT(DISTINCT rem.row_id) AS rows_with_remarks
+       FROM remarks rem
+       WHERE ${visRem.clause}`
+    )
+    .get(...visRem.params) as { total_remarks: number; rows_with_remarks: number };
+
+  const whereParts: string[] = ['r.dataset_id = ?'];
+  const whereParams: Array<number | string> = [dataset.id];
+
+  if (remarkFilter === 'with_remarks') {
+    whereParts.push(
+      `EXISTS (SELECT 1 FROM remarks rem WHERE rem.row_id = r.id AND ${visRem.clause})`
+    );
+    whereParams.push(...visRem.params);
+  } else if (remarkFilter === 'without_remarks') {
+    whereParts.push(
+      `NOT EXISTS (SELECT 1 FROM remarks rem WHERE rem.row_id = r.id AND ${visRem.clause})`
+    );
+    whereParams.push(...visRem.params);
+  }
+
+  if (jsonPath && value && value !== '__ALL__') {
+    whereParts.push(`trim(COALESCE(json_extract(r.data_json, ?), '')) = ?`);
+    whereParams.push(jsonPath, value.trim());
+  }
+
+  const trimmedQ = q.trim().toLowerCase();
+  if (trimmedQ) {
+    const likePattern = `%${trimmedQ}%`;
+    if (jsonPath) {
+      whereParts.push(`lower(COALESCE(json_extract(r.data_json, ?), '')) LIKE ?`);
+      whereParams.push(jsonPath, likePattern);
+    } else {
+      whereParts.push(
+        `(r.search_text LIKE ? OR EXISTS (SELECT 1 FROM remarks rem WHERE rem.row_id = r.id AND ${visRem.clause} AND (lower(rem.comment) LIKE ? OR lower(rem.user_name) LIKE ?)))`
+      );
+      whereParams.push(likePattern, ...visRem.params, likePattern, likePattern);
+    }
+  }
+
+  const whereSql = whereParts.join(' AND ');
+
+  const countRow = db
+    .prepare(`SELECT COUNT(*) AS cnt FROM dataset_rows r WHERE ${whereSql}`)
+    .get(...whereParams) as { cnt: number };
+  const totalFiltered = countRow.cnt;
+  const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
+  const safePage = Math.min(requestedPage, totalPages);
+  const offset = (safePage - 1) * pageSize;
+
+  const pageRowsRaw = db
+    .prepare(
+      `SELECT r.id, r.dataset_id, r.row_index, r.data_json
+       FROM dataset_rows r
+       WHERE ${whereSql}
+       ORDER BY r.row_index ASC
+       LIMIT ? OFFSET ?`
+    )
+    .all(...whereParams, pageSize, offset) as Array<{
+    id: number;
+    dataset_id: number;
+    row_index: number;
+    data_json: string;
+  }>;
+
+  const rows: DatasetRowRecord[] = pageRowsRaw.map((r) => {
+    let data: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(r.data_json);
+      if (parsed && typeof parsed === 'object') data = parsed as Record<string, string>;
+    } catch {
+      data = {};
+    }
+    return {
+      id: r.id,
+      datasetId: r.dataset_id,
+      rowIndex: r.row_index,
+      data,
+    };
+  });
+
+  const remarksByRow: Record<string, RemarkRecord[]> = {};
+  if (rows.length > 0) {
+    const placeholders = rows.map(() => '?').join(',');
+    const rowIds = rows.map((r) => r.id);
+    const pageRemarks = db
+      .prepare(
+        `SELECT rem.id, rem.dataset_id, rem.row_id, rem.user_id, rem.user_name, rem.user_role, rem.comment, rem.created_at, rem.updated_at
+         FROM remarks rem
+         WHERE ${visRem.clause} AND rem.row_id IN (${placeholders})
+         ORDER BY rem.created_at DESC, rem.id DESC`
+      )
+      .all(...visRem.params, ...rowIds) as Array<{
+      id: number;
+      dataset_id: number;
+      row_id: number;
+      user_id: number | null;
+      user_name: string;
+      user_role: UserRole;
+      comment: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    for (const rawRem of pageRemarks) {
+      const mapped = mapRemark(rawRem);
+      const key = String(mapped.rowId);
+      if (!remarksByRow[key]) remarksByRow[key] = [];
+      remarksByRow[key].push(mapped);
+    }
+  }
+
+  return {
+    rows,
+    remarksByRow,
+    totalFiltered,
+    rowsWithRemarksCount: statsRow.rows_with_remarks,
+    totalVisibleRemarks: statsRow.total_remarks,
+    page: safePage,
+    pageSize,
+  };
+}
+
+export function getAllRemarksByRowAdmin(datasetId: number): Map<number, RemarkRecord[]> {
   const rows = db
     .prepare(
       `SELECT id, dataset_id, row_id, user_id, user_name, user_role, comment, created_at, updated_at
@@ -726,7 +884,15 @@ export function getAllRemarksForDatasetAdmin(datasetId: number): RemarkRecord[] 
     created_at: string;
     updated_at: string;
   }>;
-  return rows.map(mapRemark);
+
+  const map = new Map<number, RemarkRecord[]>();
+  for (const r of rows) {
+    const mapped = mapRemark(r);
+    const list = map.get(mapped.rowId) ?? [];
+    list.push(mapped);
+    map.set(mapped.rowId, list);
+  }
+  return map;
 }
 
 export function addRemark(rowId: number, comment: string, user: SafeUser): RemarkRecord {

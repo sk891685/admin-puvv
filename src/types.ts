@@ -43,12 +43,57 @@ export interface RemarkItem {
   updatedAt: string;
 }
 
+export type RemarkFilterMode = 'all' | 'with_remarks' | 'without_remarks';
+
+export interface DatasetQuery {
+  q: string;
+  column: string;
+  value: string;
+  remarkFilter: RemarkFilterMode;
+  page: number;
+  pageSize: number;
+}
+
 export interface DatasetPayload {
   dataset: DatasetInfo | null;
   rows: DatasetRow[];
   remarksByRow: Record<string, RemarkItem[]>;
-  totalVisibleRemarks?: number;
+  totalFiltered: number;
+  rowsWithRemarksCount: number;
+  totalVisibleRemarks: number;
+  page: number;
+  pageSize: number;
 }
+
+export interface DatasetQueryOptions {
+  q?: string;
+  column?: string;
+  value?: string;
+  remarkFilter?: RemarkFilterMode;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface UploadProgress {
+  phase: 'uploading' | 'processing';
+  uploadedBytes: number;
+  totalBytes: number;
+  percent: number;
+}
+
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(2)} GB`;
+}
+
+export const formatFileSize = formatBytes;
 
 export const ROLE_META: Record<
   UserRole,

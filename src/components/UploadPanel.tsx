@@ -1,14 +1,14 @@
 import { useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
-import { Download, FileSpreadsheet, FileUp, Sparkles } from 'lucide-react';
+import { Download, FileSpreadsheet, FileUp, Sparkles, X } from 'lucide-react';
 import {
   downloadExcelWithRemarks,
   downloadSampleTemplate,
   loadSampleDataset,
   uploadSpreadsheetFile,
 } from '../api';
-import type { DatasetInfo } from '../types';
-import { formatHindiDateTime } from '../types';
+import type { DatasetInfo, UploadProgress } from '../types';
+import { formatBytes, formatHindiDateTime, MAX_UPLOAD_BYTES } from '../types';
 
 interface UploadPanelProps {
   dataset: DatasetInfo | null;
@@ -26,8 +26,12 @@ export function UploadPanel({
   onOpenSearch,
 }: UploadPanelProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadingFileName, setUploadingFileName] = useState<string>('');
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [exporting, setExporting] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [confirmSampleReplace, setConfirmSampleReplace] = useState(false);
@@ -36,17 +40,42 @@ export function UploadPanel({
   async function processFileUpload(file: File) {
     setError(null);
     setUploading(true);
+    setUploadingFileName(file.name);
+    setUploadProgress({
+      phase: 'uploading',
+      uploadedBytes: 0,
+      totalBytes: file.size,
+      percent: 0,
+    });
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
-      const res = await uploadSpreadsheetFile(file);
+      const res = await uploadSpreadsheetFile(file, {
+        signal: controller.signal,
+        onProgress: (prog) => setUploadProgress(prog),
+      });
       await onDatasetChanged();
       setPendingFile(null);
-      onNotify(`"${res.dataset.fileName}" सफलतापूर्वक अपलोड हुई (${res.dataset.rowCount} पंक्तियाँ)।`);
+      onNotify(`"${res.dataset.fileName}" सफलतापूर्वक अपलोड हुई (${res.dataset.rowCount.toLocaleString('hi-IN')} पंक्तियाँ)।`);
       onOpenSearch();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'फ़ाइल अपलोड करने में त्रुटि हुई।');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError('अपलोड रद्द कर दिया गया।');
+      } else {
+        setError(err instanceof Error ? err.message : 'फ़ाइल अपलोड करने में त्रुटि हुई।');
+      }
     } finally {
+      abortControllerRef.current = null;
       setUploading(false);
+      setUploadProgress(null);
+      setUploadingFileName('');
     }
+  }
+
+  function handleCancelUpload() {
+    abortControllerRef.current?.abort();
   }
 
   function handleSelectedFile(file: File | undefined) {
@@ -54,6 +83,14 @@ export function UploadPanel({
     setError(null);
     if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
       setError('कृपया केवल .xlsx, .xls या .csv फ़ाइल ही चुनें।');
+      return;
+    }
+    if (file.size === 0) {
+      setError('चुनी गई फ़ाइल खाली है।');
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setError('फ़ाइल का आकार अधिकतम 10 GB तक हो सकता है।');
       return;
     }
     if (dataset && totalRemarks > 0) {
@@ -72,6 +109,7 @@ export function UploadPanel({
   function handleDrop(e: DragEvent<HTMLDivElement>) {
     e.preventDefault();
     setDragging(false);
+    if (uploading) return;
     const file = e.dataTransfer.files?.[0];
     handleSelectedFile(file);
   }
@@ -127,7 +165,7 @@ export function UploadPanel({
             Excel अपलोड एवं डाउनलोड
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            .xlsx, .xls या .csv फ़ाइल अपलोड करें। पहली पंक्ति अपने-आप कॉलम हेडर बन जाएगी।
+            .xlsx, .xls या .csv फ़ाइल अपलोड करें (अधिकतम 10 GB)। पहली पंक्ति अपने-आप कॉलम हेडर बन जाएगी।
           </p>
         </div>
 
@@ -157,7 +195,7 @@ export function UploadPanel({
       {pendingFile && (
         <div className="rounded-xl bg-amber-50 border border-amber-300 p-4 sm:p-5 space-y-3">
           <p className="text-sm font-semibold text-amber-950">
-            नई फ़ाइल &quot;{pendingFile.name}&quot; अपलोड करने से पहले ध्यान दें
+            नई फ़ाइल &quot;{pendingFile.name}&quot; ({formatBytes(pendingFile.size)}) अपलोड करने से पहले ध्यान दें
           </p>
           <p className="text-sm text-amber-900">
             वर्तमान शीट में अभी <span className="font-bold tabular-nums">{totalRemarks}</span> रिमार्क दर्ज हैं। नई फ़ाइल अपलोड करने से पहले चाहें तो वर्तमान Excel डाउनलोड कर लें।
@@ -220,7 +258,7 @@ export function UploadPanel({
           <div
             onDragOver={(e) => {
               e.preventDefault();
-              setDragging(true);
+              if (!uploading) setDragging(true);
             }}
             onDragLeave={() => setDragging(false)}
             onDrop={handleDrop}
@@ -235,7 +273,7 @@ export function UploadPanel({
               Excel या CSV फ़ाइल यहाँ चुनें
             </h2>
             <p className="text-sm text-slate-600 mt-1 max-w-md mx-auto">
-              समर्थित फ़ॉर्मेट: .xlsx, .xls, .csv (अधिकतम 10 MB)। पहली पंक्ति के नाम कॉलम हेडर के रूप में उपयोग होंगे।
+              समर्थित फ़ॉर्मेट: .xlsx, .xls, .csv (अधिकतम 10 GB)। बड़ी फ़ाइलें सुरक्षित चंक स्ट्रीमिंग द्वारा अपने-आप अपलोड और प्रोसेस होंगी।
             </p>
 
             <input
@@ -246,17 +284,65 @@ export function UploadPanel({
               className="hidden"
             />
 
-            <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
-              <button
-                type="button"
-                disabled={uploading}
-                onClick={() => fileInputRef.current?.click()}
-                className="w-full sm:w-auto min-h-[48px] px-6 rounded-xl bg-blue-700 hover:bg-blue-800 active:scale-[0.99] disabled:opacity-60 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
-              >
-                <FileSpreadsheet className="h-5 w-5" />
-                <span>{uploading ? 'अपलोड हो रहा है...' : 'फ़ाइल चुनें और अपलोड करें'}</span>
-              </button>
-            </div>
+            {uploadProgress ? (
+              <div className="mt-6 max-w-md mx-auto text-left bg-white border border-slate-200 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2 text-xs sm:text-sm">
+                  <span className="font-semibold text-slate-900 truncate">
+                    {uploadingFileName}
+                  </span>
+                  <span className="font-mono-tabular font-semibold text-blue-700 shrink-0">
+                    {uploadProgress.phase === 'processing'
+                      ? 'प्रोसेसिंग...'
+                      : `${uploadProgress.percent}%`}
+                  </span>
+                </div>
+
+                <div className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all duration-150 ${
+                      uploadProgress.phase === 'processing'
+                        ? 'bg-emerald-600 animate-pulse w-full'
+                        : 'bg-blue-700'
+                    }`}
+                    style={
+                      uploadProgress.phase === 'uploading'
+                        ? { width: `${uploadProgress.percent}%` }
+                        : undefined
+                    }
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2 text-xs text-slate-600 tabular-nums">
+                  <span>
+                    {uploadProgress.phase === 'processing'
+                      ? 'फ़ाइल अपलोड हो गई — डाटाबेस में रिकॉर्ड सेव किए जा रहे हैं...'
+                      : `${formatBytes(uploadProgress.uploadedBytes)} / ${formatBytes(uploadProgress.totalBytes)}`}
+                  </span>
+                  {uploadProgress.phase === 'uploading' && (
+                    <button
+                      type="button"
+                      onClick={handleCancelUpload}
+                      className="text-red-700 hover:underline font-semibold inline-flex items-center gap-1 cursor-pointer shrink-0"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      <span>रद्द करें</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
+                <button
+                  type="button"
+                  disabled={uploading}
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full sm:w-auto min-h-[48px] px-6 rounded-xl bg-blue-700 hover:bg-blue-800 active:scale-[0.99] disabled:opacity-60 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  <FileSpreadsheet className="h-5 w-5" />
+                  <span>{uploading ? 'लोड हो रहा है...' : 'फ़ाइल चुनें और अपलोड करें'}</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Sample Helpers */}
@@ -309,7 +395,9 @@ export function UploadPanel({
                 </div>
                 <div className="py-2.5 flex justify-between gap-4">
                   <dt className="text-slate-500">कुल रिकॉर्ड (पंक्तियाँ)</dt>
-                  <dd className="font-mono-tabular font-semibold text-slate-900">{dataset.rowCount}</dd>
+                  <dd className="font-mono-tabular font-semibold text-slate-900">
+                    {dataset.rowCount.toLocaleString('hi-IN')}
+                  </dd>
                 </div>
                 <div className="py-2.5 flex justify-between gap-4">
                   <dt className="text-slate-500">कुल कॉलम</dt>
@@ -317,7 +405,9 @@ export function UploadPanel({
                 </div>
                 <div className="py-2.5 flex justify-between gap-4">
                   <dt className="text-slate-500">कुल दर्ज रिमार्क</dt>
-                  <dd className="font-mono-tabular font-semibold text-emerald-700">{totalRemarks}</dd>
+                  <dd className="font-mono-tabular font-semibold text-emerald-700">
+                    {totalRemarks.toLocaleString('hi-IN')}
+                  </dd>
                 </div>
                 <div className="py-2.5 flex justify-between gap-4">
                   <dt className="text-slate-500">अपलोड कर्ता</dt>

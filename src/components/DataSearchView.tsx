@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ChevronLeft,
   ChevronRight,
@@ -10,8 +10,15 @@ import {
   Table2,
   X,
 } from 'lucide-react';
-import { downloadExcelWithRemarks } from '../api';
-import type { DatasetInfo, DatasetRow, RemarkItem, User } from '../types';
+import { downloadExcelWithRemarks, fetchColumnValues } from '../api';
+import type {
+  DatasetInfo,
+  DatasetQuery,
+  DatasetRow,
+  RemarkFilterMode,
+  RemarkItem,
+  User,
+} from '../types';
 import { formatHindiDateTime, ROLE_META } from '../types';
 
 interface DataSearchViewProps {
@@ -19,110 +26,78 @@ interface DataSearchViewProps {
   dataset: DatasetInfo | null;
   rows: DatasetRow[];
   remarksByRow: Record<string, RemarkItem[]>;
+  totalFiltered: number;
+  rowsWithRemarksCount: number;
+  query: DatasetQuery;
   loading: boolean;
+  onQueryChange: (patch: Partial<DatasetQuery>) => void;
   onSelectRowForRemark: (row: DatasetRow) => void;
   onGoToUpload: () => void;
   onNotify: (message: string) => void;
 }
-
-type RemarkFilterMode = 'all' | 'with_remarks' | 'without_remarks';
 
 export function DataSearchView({
   currentUser,
   dataset,
   rows,
   remarksByRow,
+  totalFiltered,
+  rowsWithRemarksCount,
+  query,
   loading,
+  onQueryChange,
   onSelectRowForRemark,
   onGoToUpload,
   onNotify,
 }: DataSearchViewProps) {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedColumn, setSelectedColumn] = useState<string>('__ALL__');
-  const [selectedValue, setSelectedValue] = useState<string>('__ALL__');
-  const [remarkFilter, setRemarkFilter] = useState<RemarkFilterMode>('all');
+  const [searchInput, setSearchInput] = useState(query.q);
+  const [columnDistinctValues, setColumnDistinctValues] = useState<string[]>([]);
+  const [valuesLoading, setValuesLoading] = useState(false);
   const [mobileLayout, setMobileLayout] = useState<'table' | 'cards'>('table');
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
   const [exporting, setExporting] = useState(false);
 
   const headers = dataset?.headers ?? [];
 
-  // Reset column/value filter if dataset changes
+  // Keep local search input synced if filters are cleared externally
   useEffect(() => {
-    setSelectedColumn('__ALL__');
-    setSelectedValue('__ALL__');
-    setPage(1);
-  }, [dataset?.id]);
+    setSearchInput(query.q);
+  }, [query.q]);
 
-  // Reset value filter & page when column changes
+  // Debounce server-side search query so large datasets stay smooth
   useEffect(() => {
-    setSelectedValue('__ALL__');
-    setPage(1);
-  }, [selectedColumn]);
+    const timer = window.setTimeout(() => {
+      if (searchInput !== query.q) {
+        onQueryChange({ q: searchInput, page: 1 });
+      }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [searchInput, query.q, onQueryChange]);
 
+  // Fetch distinct values from server when a specific column is selected
   useEffect(() => {
-    setPage(1);
-  }, [searchQuery, selectedValue, remarkFilter, pageSize]);
-
-  // Distinct values for exact filtering when a specific column is picked
-  const columnDistinctValues = useMemo(() => {
-    if (selectedColumn === '__ALL__' || rows.length === 0) return [];
-    const set = new Set<string>();
-    for (const r of rows) {
-      const val = (r.data[selectedColumn] ?? '').trim();
-      if (val) set.add(val);
-      if (set.size > 200) break;
+    if (!dataset || query.column === '__ALL__') {
+      setColumnDistinctValues([]);
+      return;
     }
-    return Array.from(set).sort((a, b) => a.localeCompare(b, 'hi'));
-  }, [rows, selectedColumn]);
+    let cancelled = false;
+    setValuesLoading(true);
+    fetchColumnValues(query.column)
+      .then((vals) => {
+        if (!cancelled) setColumnDistinctValues(vals);
+      })
+      .catch(() => {
+        if (!cancelled) setColumnDistinctValues([]);
+      })
+      .finally(() => {
+        if (!cancelled) setValuesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dataset?.id, query.column]);
 
-  const filteredRows = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return rows.filter((row) => {
-      const rowRemarks = remarksByRow[String(row.id)] ?? [];
-      if (remarkFilter === 'with_remarks' && rowRemarks.length === 0) return false;
-      if (remarkFilter === 'without_remarks' && rowRemarks.length > 0) return false;
-
-      if (selectedColumn !== '__ALL__' && selectedValue !== '__ALL__') {
-        const cell = (row.data[selectedColumn] ?? '').trim();
-        if (cell !== selectedValue) return false;
-      }
-
-      if (!q) return true;
-
-      if (selectedColumn !== '__ALL__') {
-        const cellVal = (row.data[selectedColumn] ?? '').toLowerCase();
-        return cellVal.includes(q);
-      }
-
-      // Search across all Excel columns + visible remarks
-      for (const h of headers) {
-        if ((row.data[h] ?? '').toLowerCase().includes(q)) return true;
-      }
-      for (const rem of rowRemarks) {
-        if (rem.comment.toLowerCase().includes(q) || rem.userName.toLowerCase().includes(q)) {
-          return true;
-        }
-      }
-      return false;
-    });
-  }, [rows, remarksByRow, remarkFilter, selectedColumn, selectedValue, searchQuery, headers]);
-
-  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
-  const safePage = Math.min(page, totalPages);
-  const visibleRows = useMemo(() => {
-    const start = (safePage - 1) * pageSize;
-    return filteredRows.slice(start, start + pageSize);
-  }, [filteredRows, safePage, pageSize]);
-
-  const rowsWithRemarksCount = useMemo(() => {
-    let count = 0;
-    for (const r of rows) {
-      if ((remarksByRow[String(r.id)]?.length ?? 0) > 0) count += 1;
-    }
-    return count;
-  }, [rows, remarksByRow]);
+  const totalPages = Math.max(1, Math.ceil(totalFiltered / query.pageSize));
+  const safePage = Math.min(query.page, totalPages);
 
   async function handleQuickExport() {
     setExporting(true);
@@ -137,19 +112,23 @@ export function DataSearchView({
   }
 
   function clearFilters() {
-    setSearchQuery('');
-    setSelectedColumn('__ALL__');
-    setSelectedValue('__ALL__');
-    setRemarkFilter('all');
+    setSearchInput('');
+    onQueryChange({
+      q: '',
+      column: '__ALL__',
+      value: '__ALL__',
+      remarkFilter: 'all',
+      page: 1,
+    });
   }
 
   const hasActiveFilter =
-    searchQuery.trim() !== '' ||
-    selectedColumn !== '__ALL__' ||
-    selectedValue !== '__ALL__' ||
-    remarkFilter !== 'all';
+    query.q.trim() !== '' ||
+    query.column !== '__ALL__' ||
+    query.value !== '__ALL__' ||
+    query.remarkFilter !== 'all';
 
-  if (loading) {
+  if (loading && !dataset) {
     return (
       <div className="space-y-4">
         <div className="h-14 rounded-2xl bg-slate-200/70 animate-pulse" />
@@ -167,7 +146,7 @@ export function DataSearchView({
         </h1>
         <p className="text-sm sm:text-base text-slate-600 mt-2">
           {currentUser.role === 'admin'
-            ? 'शुरुआत करने के लिए अपनी .xlsx, .xls या .csv फ़ाइल अपलोड करें। उसके बाद सभी यूज़र डाटा सर्च कर सकेंगे और रिमार्क लिख सकेंगे।'
+            ? 'शुरुआत करने के लिए अपनी .xlsx, .xls या .csv फ़ाइल (10 GB तक) अपलोड करें। उसके बाद सभी यूज़र डाटा सर्च कर सकेंगे और रिमार्क लिख सकेंगे।'
             : 'कृपया अपने Admin से Excel शीट अपलोड करने के लिए कहें। अपलोड होते ही यहाँ सारा डाटा सर्च के लिए उपलब्ध हो जाएगा।'}
         </p>
         {currentUser.role === 'admin' && (
@@ -195,9 +174,9 @@ export function DataSearchView({
           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs sm:text-sm text-slate-600 tabular-nums">
             <span className="font-medium text-slate-800">{dataset.fileName}</span>
             <span aria-hidden="true">·</span>
-            <span>कुल {dataset.rowCount} रिकॉर्ड</span>
+            <span>कुल {dataset.rowCount.toLocaleString('hi-IN')} रिकॉर्ड</span>
             <span aria-hidden="true">·</span>
-            <span>{rowsWithRemarksCount} में रिमार्क दर्ज</span>
+            <span>{rowsWithRemarksCount.toLocaleString('hi-IN')} में रिमार्क दर्ज</span>
             <span aria-hidden="true">·</span>
             <span className="text-slate-500">{ROLE_META[currentUser.role].remarkVisibilityHint}</span>
           </div>
@@ -228,19 +207,22 @@ export function DataSearchView({
             <input
               id="global-search"
               type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               placeholder={
-                selectedColumn === '__ALL__'
+                query.column === '__ALL__'
                   ? 'Consumer No., नाम, फीडर, ट्रांसफार्मर आदि खोजें...'
-                  : `"${selectedColumn}" कॉलम में खोजें...`
+                  : `"${query.column}" कॉलम में खोजें...`
               }
               className="w-full min-h-[48px] rounded-xl border border-slate-300 bg-white pl-11 pr-11 text-base text-slate-900 placeholder:text-slate-400 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
             />
-            {searchQuery && (
+            {searchInput && (
               <button
                 type="button"
-                onClick={() => setSearchQuery('')}
+                onClick={() => {
+                  setSearchInput('');
+                  onQueryChange({ q: '', page: 1 });
+                }}
                 aria-label="खोज साफ़ करें"
                 className="absolute right-1.5 top-1/2 -translate-y-1/2 min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-400 hover:text-slate-700 cursor-pointer"
               >
@@ -256,8 +238,10 @@ export function DataSearchView({
             </label>
             <select
               id="column-filter"
-              value={selectedColumn}
-              onChange={(e) => setSelectedColumn(e.target.value)}
+              value={query.column}
+              onChange={(e) =>
+                onQueryChange({ column: e.target.value, value: '__ALL__', page: 1 })
+              }
               className="w-full min-h-[48px] rounded-xl border border-slate-300 bg-white px-3.5 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
             >
               <option value="__ALL__">कॉलम फ़िल्टर: सभी कॉलम</option>
@@ -276,14 +260,16 @@ export function DataSearchView({
             </label>
             <select
               id="value-filter"
-              disabled={selectedColumn === '__ALL__' || columnDistinctValues.length === 0}
-              value={selectedValue}
-              onChange={(e) => setSelectedValue(e.target.value)}
+              disabled={query.column === '__ALL__' || valuesLoading || columnDistinctValues.length === 0}
+              value={query.value}
+              onChange={(e) => onQueryChange({ value: e.target.value, page: 1 })}
               className="w-full min-h-[48px] rounded-xl border border-slate-300 bg-white px-3.5 text-sm sm:text-base text-slate-900 disabled:bg-slate-50 disabled:text-slate-400 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
             >
               <option value="__ALL__">
-                {selectedColumn === '__ALL__'
+                {query.column === '__ALL__'
                   ? 'पहले कॉलम चुनें'
+                  : valuesLoading
+                  ? 'मान लोड हो रहे हैं...'
                   : `सभी मान (${columnDistinctValues.length})`}
               </option>
               {columnDistinctValues.map((val) => (
@@ -300,17 +286,20 @@ export function DataSearchView({
           <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl overflow-x-auto max-w-full">
             {(
               [
-                { id: 'all', label: `सभी (${rows.length})` },
-                { id: 'with_remarks', label: `रिमार्क वाले (${rowsWithRemarksCount})` },
-                { id: 'without_remarks', label: `बिना रिमार्क (${rows.length - rowsWithRemarksCount})` },
-              ] as const
+                { id: 'all', label: `सभी (${dataset.rowCount.toLocaleString('hi-IN')})` },
+                { id: 'with_remarks', label: `रिमार्क वाले (${rowsWithRemarksCount.toLocaleString('hi-IN')})` },
+                {
+                  id: 'without_remarks',
+                  label: `बिना रिमार्क (${Math.max(0, dataset.rowCount - rowsWithRemarksCount).toLocaleString('hi-IN')})`,
+                },
+              ] as Array<{ id: RemarkFilterMode; label: string }>
             ).map((tab) => (
               <button
                 key={tab.id}
                 type="button"
-                onClick={() => setRemarkFilter(tab.id)}
+                onClick={() => onQueryChange({ remarkFilter: tab.id, page: 1 })}
                 className={`min-h-[38px] px-3.5 rounded-lg text-xs sm:text-sm font-medium transition-colors whitespace-nowrap shrink-0 tabular-nums cursor-pointer ${
-                  remarkFilter === tab.id
+                  query.remarkFilter === tab.id
                     ? 'bg-white text-slate-900 shadow-xs'
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
@@ -322,7 +311,7 @@ export function DataSearchView({
 
           <div className="flex items-center gap-3">
             <span className="text-xs sm:text-sm font-medium text-slate-600 tabular-nums">
-              परिणाम: <strong className="text-slate-900">{filteredRows.length}</strong>
+              परिणाम: <strong className="text-slate-900">{totalFiltered.toLocaleString('hi-IN')}</strong>
             </span>
 
             {hasActiveFilter && (
@@ -365,7 +354,7 @@ export function DataSearchView({
       </section>
 
       {/* Results Area */}
-      {filteredRows.length === 0 ? (
+      {rows.length === 0 && !loading ? (
         <div className="bg-white border border-slate-200 rounded-2xl p-8 text-center">
           <p className="text-base font-semibold text-slate-900">कोई मिलता-जुलता रिकॉर्ड नहीं मिला।</p>
           <p className="text-sm text-slate-500 mt-1">
@@ -382,10 +371,10 @@ export function DataSearchView({
           )}
         </div>
       ) : (
-        <>
-          {/* Mobile Card Layout (when user chooses Card mode on small screens) */}
+        <div className={loading ? 'opacity-65 transition-opacity' : ''}>
+          {/* Mobile Card Layout */}
           <div className={`${mobileLayout === 'cards' ? 'block md:hidden' : 'hidden'} space-y-3`}>
-            {visibleRows.map((row) => {
+            {rows.map((row) => {
               const rowRemarks = remarksByRow[String(row.id)] ?? [];
               const latest = rowRemarks[0];
               return (
@@ -441,7 +430,7 @@ export function DataSearchView({
             })}
           </div>
 
-          {/* Crisp Responsive Data Table (Always visible on Desktop, default on Mobile) */}
+          {/* Crisp Responsive Data Table */}
           <section
             className={`${
               mobileLayout === 'cards' ? 'hidden md:block' : 'block'
@@ -455,10 +444,7 @@ export function DataSearchView({
                       #
                     </th>
                     {headers.map((header) => (
-                      <th
-                        key={header}
-                        className="py-3 px-3.5 whitespace-nowrap"
-                      >
+                      <th key={header} className="py-3 px-3.5 whitespace-nowrap">
                         {header}
                       </th>
                     ))}
@@ -471,7 +457,7 @@ export function DataSearchView({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 text-sm">
-                  {visibleRows.map((row) => {
+                  {rows.map((row) => {
                     const rowRemarks = remarksByRow[String(row.id)] ?? [];
                     const latest = rowRemarks[0];
                     return (
@@ -540,8 +526,8 @@ export function DataSearchView({
                 </label>
                 <select
                   id="page-size-select"
-                  value={pageSize}
-                  onChange={(e) => setPageSize(Number(e.target.value))}
+                  value={query.pageSize}
+                  onChange={(e) => onQueryChange({ pageSize: Number(e.target.value), page: 1 })}
                   className="min-h-[36px] rounded-lg border border-slate-300 bg-white px-2 text-xs text-slate-800"
                 >
                   <option value={25}>25 प्रति पृष्ठ</option>
@@ -554,7 +540,7 @@ export function DataSearchView({
                 <button
                   type="button"
                   disabled={safePage <= 1}
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  onClick={() => onQueryChange({ page: Math.max(1, safePage - 1) })}
                   className="min-h-[40px] px-3.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 text-slate-700 font-medium inline-flex items-center gap-1 cursor-pointer"
                 >
                   <ChevronLeft className="h-4 w-4" />
@@ -563,7 +549,7 @@ export function DataSearchView({
                 <button
                   type="button"
                   disabled={safePage >= totalPages}
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  onClick={() => onQueryChange({ page: Math.min(totalPages, safePage + 1) })}
                   className="min-h-[40px] px-3.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-40 text-slate-700 font-medium inline-flex items-center gap-1 cursor-pointer"
                 >
                   <span>अगला</span>
@@ -572,7 +558,32 @@ export function DataSearchView({
               </div>
             </div>
           </section>
-        </>
+
+          {/* Mobile Card Pagination */}
+          {mobileLayout === 'cards' && totalPages > 1 && (
+            <div className="md:hidden mt-3 flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-2xl px-4 py-3 text-xs">
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => onQueryChange({ page: Math.max(1, safePage - 1) })}
+                className="min-h-[42px] px-4 rounded-xl border border-slate-300 bg-white disabled:opacity-40 font-medium text-slate-700"
+              >
+                पिछला
+              </button>
+              <span className="font-medium text-slate-700 tabular-nums">
+                पृष्ठ {safePage} / {totalPages}
+              </span>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => onQueryChange({ page: Math.min(totalPages, safePage + 1) })}
+                className="min-h-[42px] px-4 rounded-xl border border-slate-300 bg-white disabled:opacity-40 font-medium text-slate-700"
+              >
+                अगला
+              </button>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );

@@ -7,10 +7,19 @@ import { PuvvnlLogo } from './components/PuvvnlLogo';
 import { RemarkSheet } from './components/RemarkSheet';
 import { UploadPanel } from './components/UploadPanel';
 import { UserManagement } from './components/UserManagement';
-import type { AuthStatus, DatasetInfo, DatasetRow, RemarkItem, User } from './types';
+import type { AuthStatus, DatasetInfo, DatasetQuery, DatasetRow, RemarkItem, User } from './types';
 import { ROLE_META } from './types';
 
 type ActiveTab = 'search' | 'upload' | 'users';
+
+const DEFAULT_QUERY: DatasetQuery = {
+  q: '',
+  column: '__ALL__',
+  value: '__ALL__',
+  remarkFilter: 'all',
+  page: 1,
+  pageSize: 25,
+};
 
 export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
@@ -21,7 +30,10 @@ export default function App() {
   const [dataset, setDataset] = useState<DatasetInfo | null>(null);
   const [rows, setRows] = useState<DatasetRow[]>([]);
   const [remarksByRow, setRemarksByRow] = useState<Record<string, RemarkItem[]>>({});
+  const [totalFiltered, setTotalFiltered] = useState(0);
+  const [rowsWithRemarksCount, setRowsWithRemarksCount] = useState(0);
   const [totalVisibleRemarks, setTotalVisibleRemarks] = useState(0);
+  const [datasetQuery, setDatasetQuery] = useState<DatasetQuery>(DEFAULT_QUERY);
   const [datasetLoading, setDatasetLoading] = useState(false);
 
   const [selectedRow, setSelectedRow] = useState<DatasetRow | null>(null);
@@ -51,20 +63,26 @@ export default function App() {
     void loadAuthStatus();
   }, [loadAuthStatus]);
 
-  const loadDataset = useCallback(async () => {
-    setDatasetLoading(true);
-    try {
-      const payload = await fetchDataset();
-      setDataset(payload.dataset);
-      setRows(payload.rows);
-      setRemarksByRow(payload.remarksByRow);
-      setTotalVisibleRemarks(payload.totalVisibleRemarks ?? 0);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'डाटा लोड करने में समस्या आई।');
-    } finally {
-      setDatasetLoading(false);
-    }
-  }, [showToast]);
+  const loadDataset = useCallback(
+    async (overrideQuery?: DatasetQuery) => {
+      const activeQuery = overrideQuery ?? datasetQuery;
+      setDatasetLoading(true);
+      try {
+        const payload = await fetchDataset(activeQuery);
+        setDataset(payload.dataset);
+        setRows(payload.rows);
+        setRemarksByRow(payload.remarksByRow);
+        setTotalFiltered(payload.totalFiltered);
+        setRowsWithRemarksCount(payload.rowsWithRemarksCount);
+        setTotalVisibleRemarks(payload.totalVisibleRemarks);
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'डाटा लोड करने में समस्या आई।');
+      } finally {
+        setDatasetLoading(false);
+      }
+    },
+    [datasetQuery, showToast]
+  );
 
   useEffect(() => {
     if (currentUser) {
@@ -72,11 +90,23 @@ export default function App() {
     }
   }, [currentUser, loadDataset]);
 
+  const handleQueryChange = useCallback((patch: Partial<DatasetQuery>) => {
+    setDatasetQuery((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleDatasetReplaced = useCallback(async () => {
+    setDatasetQuery(DEFAULT_QUERY);
+    await loadDataset(DEFAULT_QUERY);
+  }, [loadDataset]);
+
   function handleAuthenticated(token: string, user: User) {
     setAuthToken(token);
     setCurrentUser(user);
+    setDatasetQuery(DEFAULT_QUERY);
     setActiveTab('search');
-    setAuthStatus((prev) => (prev ? { ...prev, needsAdminSetup: false } : { needsAdminSetup: false, envAdminConfigured: false }));
+    setAuthStatus((prev) =>
+      prev ? { ...prev, needsAdminSetup: false } : { needsAdminSetup: false, envAdminConfigured: false }
+    );
   }
 
   async function handleLogout() {
@@ -85,6 +115,10 @@ export default function App() {
     setDataset(null);
     setRows([]);
     setRemarksByRow({});
+    setTotalFiltered(0);
+    setRowsWithRemarksCount(0);
+    setTotalVisibleRemarks(0);
+    setDatasetQuery(DEFAULT_QUERY);
     setSelectedRow(null);
     setActiveTab('search');
     void loadAuthStatus();
@@ -93,6 +127,10 @@ export default function App() {
   function handleRemarkAdded(rowId: number, remark: RemarkItem) {
     setRemarksByRow((prev) => {
       const key = String(rowId);
+      const hadRemarks = (prev[key]?.length ?? 0) > 0;
+      if (!hadRemarks) {
+        setRowsWithRemarksCount((c) => c + 1);
+      }
       return {
         ...prev,
         [key]: [remark, ...(prev[key] ?? [])],
@@ -114,9 +152,13 @@ export default function App() {
   function handleRemarkDeleted(rowId: number, remarkId: number) {
     setRemarksByRow((prev) => {
       const key = String(rowId);
+      const nextList = (prev[key] ?? []).filter((r) => r.id !== remarkId);
+      if (nextList.length === 0 && (prev[key]?.length ?? 0) > 0) {
+        setRowsWithRemarksCount((c) => Math.max(0, c - 1));
+      }
       return {
         ...prev,
-        [key]: (prev[key] ?? []).filter((r) => r.id !== remarkId),
+        [key]: nextList,
       };
     });
     setTotalVisibleRemarks((c) => Math.max(0, c - 1));
@@ -268,7 +310,11 @@ export default function App() {
             dataset={dataset}
             rows={rows}
             remarksByRow={remarksByRow}
+            totalFiltered={totalFiltered}
+            rowsWithRemarksCount={rowsWithRemarksCount}
+            query={datasetQuery}
             loading={datasetLoading}
+            onQueryChange={handleQueryChange}
             onSelectRowForRemark={(row) => setSelectedRow(row)}
             onGoToUpload={() => setActiveTab('upload')}
             onNotify={showToast}
@@ -279,7 +325,7 @@ export default function App() {
           <UploadPanel
             dataset={dataset}
             totalRemarks={totalVisibleRemarks}
-            onDatasetChanged={loadDataset}
+            onDatasetChanged={handleDatasetReplaced}
             onNotify={showToast}
             onOpenSearch={() => setActiveTab('search')}
           />
@@ -290,7 +336,7 @@ export default function App() {
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Tab Bar for Admin (thumb-zone ergonomic navigation) */}
+      {/* Mobile Fixed Bottom Tab Bar for Admin */}
       {isAdmin && (
         <nav
           aria-label="मोबाइल नेविगेशन"
