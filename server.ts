@@ -11,6 +11,7 @@ import {
   claimFirstAdmin,
   createSession,
   createUserAccount,
+  deleteActiveDataset,
   deleteRemark,
   deleteUserAccount,
   getActiveDataset,
@@ -563,6 +564,19 @@ async function startServer(): Promise<void> {
       }
     }
     res.json({ ok: true });
+  });
+
+  app.delete('/api/dataset', requireAuth, requireAdmin, (_req: AuthedRequest, res: Response) => {
+    try {
+      const deleted = deleteActiveDataset();
+      if (!deleted) {
+        res.status(404).json({ error: 'हटाने के लिए कोई सक्रिय Excel डाटा उपलब्ध नहीं है।' });
+        return;
+      }
+      res.json({ ok: true });
+    } catch {
+      res.status(500).json({ error: 'Excel डाटा हटाने में त्रुटि हुई।' });
+    }
   });
 
   app.post('/api/dataset/load-sample', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {

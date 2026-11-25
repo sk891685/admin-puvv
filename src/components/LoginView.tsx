@@ -3,7 +3,6 @@ import type { FormEvent } from 'react';
 import { Eye, EyeOff, Lock, ShieldCheck, User as UserIcon } from 'lucide-react';
 import { loginWithPassword, setupFirstAdmin } from '../api';
 import type { AuthStatus, User } from '../types';
-import { ROLE_META } from '../types';
 import { PuvvnlLogo } from './PuvvnlLogo';
 
 interface LoginViewProps {
@@ -57,7 +56,7 @@ export function LoginView({ authStatus, onAuthenticated }: LoginViewProps) {
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <header className="bg-white border-b border-slate-200 px-4 sm:px-8 py-3.5">
-        <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
+        <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <PuvvnlLogo size="sm" />
             <span className="text-base sm:text-lg font-bold tracking-tight text-slate-900 truncate">
@@ -71,63 +70,31 @@ export function LoginView({ authStatus, onAuthenticated }: LoginViewProps) {
       </header>
 
       <main className="flex-1 flex items-center justify-center px-4 py-8 sm:py-12">
-        <div className="w-full max-w-5xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
-          {/* Left Identity & Role Guide Panel */}
-          <section className="lg:col-span-6 bg-blue-950 text-white rounded-2xl p-6 sm:p-10 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center gap-4 mb-6">
-                <PuvvnlLogo size="lg" className="p-1 shadow-sm" />
-                <div>
-                  <p className="text-xs text-blue-200 font-medium">
-                    पूर्वांचल विद्युत वितरण निगम लिमिटेड
-                  </p>
-                  <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white mt-0.5">
-                    Excel डाटा सर्च एवं फील्ड रिमार्क प्रणाली
-                  </h1>
-                </div>
-              </div>
-
-              <p className="text-sm sm:text-base text-blue-100 leading-relaxed mb-8">
-                उपभोक्ता संख्या, नाम, फीडर और ट्रांसफार्मर के अनुसार तुरंत रिकॉर्ड खोजें और सुरक्षित रोल-आधारित रिमार्क दर्ज करें। मूल Excel डाटा हमेशा सुरक्षित रहता है।
-              </p>
-
-              <div className="border-t border-blue-800/80 pt-6 space-y-4">
-                <h2 className="text-sm font-semibold text-blue-200">
-                  रोल के अनुसार अनुमतियाँ
-                </h2>
-                <dl className="space-y-3 text-sm">
-                  {(['admin', 'je', 'supervisor', 'lineman'] as const).map((roleKey) => (
-                    <div
-                      key={roleKey}
-                      className="grid grid-cols-1 sm:grid-cols-12 gap-1 sm:gap-3 pb-3 border-b border-blue-900/80 last:border-b-0 last:pb-0"
-                    >
-                      <dt className="sm:col-span-4 font-semibold text-white">
-                        {ROLE_META[roleKey].hindiLabel}
-                      </dt>
-                      <dd className="sm:col-span-8 text-blue-100/90 leading-snug">
-                        {ROLE_META[roleKey].permissionSummary}
-                      </dd>
-                    </div>
-                  ))}
-                </dl>
-              </div>
-            </div>
-
-            <p className="text-xs text-blue-300 mt-8 pt-4 border-t border-blue-900">
-              सभी रिमार्क यूज़र नाम, रोल और तारीख-समय के साथ अपने-आप सेव होते हैं।
+        <div className="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">
+          {/* Left PuVVNL Identity Panel */}
+          <section className="lg:col-span-5 bg-blue-950 text-white rounded-2xl p-6 sm:p-9 flex flex-col items-center justify-center text-center">
+            <PuvvnlLogo size="lg" className="p-1.5 shadow-sm mb-5" />
+            <p className="text-xs sm:text-sm text-blue-200 font-medium">
+              पूर्वांचल विद्युत वितरण निगम लिमिटेड
+            </p>
+            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white mt-2">
+              Excel डाटा सर्च एवं रिमार्क पोर्टल
+            </h1>
+            <p className="text-sm text-blue-100/90 leading-relaxed mt-4 max-w-xs">
+              उपभोक्ता संख्या, नाम, फीडर और ट्रांसफार्मर के अनुसार रिकॉर्ड खोजें और फील्ड रिमार्क दर्ज करें।
             </p>
           </section>
 
           {/* Right Form Panel */}
-          <section className="lg:col-span-6 bg-white border border-slate-200 rounded-2xl p-6 sm:p-10 flex flex-col justify-center">
+          <section className="lg:col-span-7 bg-white border border-slate-200 rounded-2xl p-6 sm:p-10 flex flex-col justify-center">
             <div className="mb-6">
               <h2 className="text-xl sm:text-2xl font-bold text-slate-900">
                 {isSetupMode ? 'पहली बार Admin खाता सेटअप करें' : 'पोर्टल में लॉगिन करें'}
               </h2>
               <p className="text-sm text-slate-600 mt-1.5">
                 {isSetupMode
-                  ? 'शुरुआत करने के लिए मुख्य Admin का यूज़र नाम और पासवर्ड तय करें। इसके बाद आप JE, Supervisor और Lineman बना सकेंगे।'
-                  : 'अपने Admin द्वारा दिए गए यूज़र नाम और पासवर्ड से प्रवेश करें।'}
+                  ? 'शुरुआत करने के लिए मुख्य Admin का यूज़र नाम और पासवर्ड तय करें।'
+                  : 'अपने यूज़र नाम और पासवर्ड से प्रवेश करें।'}
               </p>
             </div>
 
@@ -198,7 +165,7 @@ export function LoginView({ authStatus, onAuthenticated }: LoginViewProps) {
                     type="button"
                     onClick={() => setShowPassword((prev) => !prev)}
                     aria-label={showPassword ? 'पासवर्ड छुपाएँ' : 'पासवर्ड देखें'}
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-800"
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 min-h-[40px] min-w-[40px] flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-800 cursor-pointer"
                   >
                     {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
                   </button>

@@ -552,6 +552,19 @@ export function abortStagedDataset(datasetId: number): void {
   db.prepare('DELETE FROM datasets WHERE id = ? AND is_active = 0').run(datasetId);
 }
 
+const deleteActiveDatasetTxn = db.transaction((): boolean => {
+  const active = db
+    .prepare('SELECT id FROM datasets WHERE is_active = 1 ORDER BY id DESC LIMIT 1')
+    .get() as { id: number } | undefined;
+  if (!active) return false;
+  db.prepare('DELETE FROM datasets WHERE id = ?').run(active.id);
+  return true;
+});
+
+export function deleteActiveDataset(): boolean {
+  return deleteActiveDatasetTxn();
+}
+
 export function saveNewDataset(
   fileName: string,
   headers: string[],

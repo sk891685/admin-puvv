@@ -216,6 +216,12 @@ export async function uploadSpreadsheetFile(
   }
 }
 
+export async function deleteActiveDataset(): Promise<void> {
+  await apiFetch<{ ok: boolean }>('/api/dataset', {
+    method: 'DELETE',
+  });
+}
+
 export async function loadSampleDataset(): Promise<{ dataset: DatasetInfo }> {
   return apiFetch<{ dataset: DatasetInfo }>('/api/dataset/load-sample', {
     method: 'POST',

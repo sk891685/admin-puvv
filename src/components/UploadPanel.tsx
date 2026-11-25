@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
-import { Download, FileSpreadsheet, FileUp, Sparkles, X } from 'lucide-react';
+import { Download, FileSpreadsheet, FileUp, Sparkles, Trash2, X } from 'lucide-react';
 import {
+  deleteActiveDataset,
   downloadExcelWithRemarks,
   downloadSampleTemplate,
   loadSampleDataset,
@@ -33,12 +34,15 @@ export function UploadPanel({
   const [uploadingFileName, setUploadingFileName] = useState<string>('');
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [confirmSampleReplace, setConfirmSampleReplace] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function processFileUpload(file: File) {
     setError(null);
+    setConfirmDelete(false);
     setUploading(true);
     setUploadingFileName(file.name);
     setUploadProgress({
@@ -58,7 +62,9 @@ export function UploadPanel({
       });
       await onDatasetChanged();
       setPendingFile(null);
-      onNotify(`"${res.dataset.fileName}" सफलतापूर्वक अपलोड हुई (${res.dataset.rowCount.toLocaleString('hi-IN')} पंक्तियाँ)।`);
+      onNotify(
+        `"${res.dataset.fileName}" सफलतापूर्वक अपलोड हुई (${res.dataset.rowCount.toLocaleString('hi-IN')} पंक्तियाँ)।`
+      );
       onOpenSearch();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -127,12 +133,29 @@ export function UploadPanel({
     }
   }
 
+  async function handleDeleteDataset() {
+    setError(null);
+    setDeleting(true);
+    try {
+      await deleteActiveDataset();
+      setConfirmDelete(false);
+      setPendingFile(null);
+      await onDatasetChanged();
+      onNotify('सक्रिय Excel डाटा सफलतापूर्वक डिलीट हो गया।');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Excel डाटा डिलीट करने में त्रुटि हुई।');
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function handleLoadSample(force = false) {
     if (dataset && totalRemarks > 0 && !force) {
       setConfirmSampleReplace(true);
       return;
     }
     setError(null);
+    setConfirmDelete(false);
     setUploading(true);
     try {
       const res = await loadSampleDataset();
@@ -162,23 +185,35 @@ export function UploadPanel({
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
           <h1 className="text-xl sm:text-2xl font-bold text-slate-900">
-            Excel अपलोड एवं डाउनलोड
+            Excel अपलोड, डाउनलोड एवं डिलीट
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            .xlsx, .xls या .csv फ़ाइल अपलोड करें (अधिकतम 10 GB)। पहली पंक्ति अपने-आप कॉलम हेडर बन जाएगी।
+            .xlsx, .xls या .csv फ़ाइल अपलोड करें (अधिकतम 10 GB), डाउनलोड करें या वर्तमान शीट डिलीट करें।
           </p>
         </div>
 
         {dataset && (
-          <button
-            type="button"
-            disabled={exporting}
-            onClick={handleExport}
-            className="min-h-[48px] px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-60 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Download className="h-5 w-5" />
-            <span>{exporting ? 'तैयार हो रहा है...' : 'रिमार्क के साथ Excel डाउनलोड करें'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              disabled={exporting || deleting}
+              onClick={handleExport}
+              className="min-h-[46px] px-4 sm:px-5 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-60 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all whitespace-nowrap cursor-pointer"
+            >
+              <Download className="h-4 w-4" />
+              <span>{exporting ? 'तैयार हो रहा है...' : 'रिमार्क सहित डाउनलोड'}</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={uploading || deleting}
+              onClick={() => setConfirmDelete(true)}
+              className="min-h-[46px] px-4 sm:px-5 rounded-xl border border-red-300 bg-white hover:bg-red-50 active:scale-[0.99] disabled:opacity-60 text-red-700 font-semibold text-sm flex items-center justify-center gap-2 transition-all whitespace-nowrap cursor-pointer"
+            >
+              <Trash2 className="h-4 w-4" />
+              <span>Excel डिलीट करें</span>
+            </button>
+          </div>
         )}
       </div>
 
@@ -188,6 +223,52 @@ export function UploadPanel({
           className="rounded-xl bg-red-50 border border-red-200 px-4 py-3.5 text-sm text-red-800"
         >
           {error}
+        </div>
+      )}
+
+      {/* Delete Active Excel Dataset Confirmation Banner */}
+      {confirmDelete && dataset && (
+        <div
+          role="alertdialog"
+          className="rounded-xl bg-red-50 border border-red-300 p-4 sm:p-5 space-y-3"
+        >
+          <p className="text-sm font-bold text-red-950">
+            क्या आप वाकई &quot;{dataset.fileName}&quot; को डिलीट करना चाहते हैं?
+          </p>
+          <p className="text-sm text-red-900">
+            इससे शीट के सभी <span className="font-bold tabular-nums">{dataset.rowCount.toLocaleString('hi-IN')}</span> रिकॉर्ड
+            {totalRemarks > 0
+              ? ` और उसमें दर्ज ${totalRemarks.toLocaleString('hi-IN')} रिमार्क`
+              : ''}{' '}
+            स्थायी रूप से हट जाएंगे। चाहें तो डिलीट करने से पहले Excel डाउनलोड कर लें।
+          </p>
+          <div className="flex flex-wrap gap-2.5 pt-1">
+            <button
+              type="button"
+              disabled={exporting || deleting}
+              onClick={handleExport}
+              className="min-h-[44px] px-4 rounded-xl bg-white border border-red-300 text-red-900 font-semibold text-sm hover:bg-red-100 cursor-pointer"
+            >
+              पहले बैकअप डाउनलोड करें
+            </button>
+            <button
+              type="button"
+              disabled={deleting}
+              onClick={() => void handleDeleteDataset()}
+              className="min-h-[44px] px-5 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white font-semibold text-sm flex items-center gap-2 cursor-pointer"
+            >
+              <Trash2 className="h-4 w-4" />
+              <span>{deleting ? 'डिलीट हो रहा है...' : 'हाँ, स्थायी रूप से डिलीट करें'}</span>
+            </button>
+            <button
+              type="button"
+              disabled={deleting}
+              onClick={() => setConfirmDelete(false)}
+              className="min-h-[44px] px-4 rounded-xl border border-slate-300 bg-white text-slate-700 font-medium text-sm hover:bg-slate-50 cursor-pointer"
+            >
+              रद्द करें
+            </button>
+          </div>
         </div>
       )}
 
@@ -270,7 +351,7 @@ export function UploadPanel({
           >
             <FileUp className="h-10 w-10 text-blue-700 mx-auto mb-3" />
             <h2 className="text-base sm:text-lg font-bold text-slate-900">
-              Excel या CSV फ़ाइल यहाँ चुनें
+              Excel या CSV फ़ाइल यहाँ अपलोड करें
             </h2>
             <p className="text-sm text-slate-600 mt-1 max-w-md mx-auto">
               समर्थित फ़ॉर्मेट: .xlsx, .xls, .csv (अधिकतम 10 GB)। बड़ी फ़ाइलें सुरक्षित चंक स्ट्रीमिंग द्वारा अपने-आप अपलोड और प्रोसेस होंगी।
@@ -334,7 +415,7 @@ export function UploadPanel({
               <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
                 <button
                   type="button"
-                  disabled={uploading}
+                  disabled={uploading || deleting}
                   onClick={() => fileInputRef.current?.click()}
                   className="w-full sm:w-auto min-h-[48px] px-6 rounded-xl bg-blue-700 hover:bg-blue-800 active:scale-[0.99] disabled:opacity-60 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
                 >
@@ -356,7 +437,7 @@ export function UploadPanel({
             <div className="flex flex-wrap gap-2 shrink-0">
               <button
                 type="button"
-                disabled={uploading}
+                disabled={uploading || deleting}
                 onClick={() => void handleLoadSample(false)}
                 className="min-h-[44px] px-4 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100 text-blue-800 font-semibold text-xs sm:text-sm flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
@@ -375,7 +456,7 @@ export function UploadPanel({
           </div>
         </section>
 
-        {/* Active Sheet Info */}
+        {/* Active Sheet Info & Delete Control */}
         <section className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl p-5 sm:p-7 space-y-5">
           <h2 className="text-base font-bold text-slate-900">वर्तमान सक्रिय शीट</h2>
 
@@ -426,6 +507,18 @@ export function UploadPanel({
                 <p className="text-xs text-slate-600 leading-relaxed">
                   {dataset.headers.join(' · ')}
                 </p>
+              </div>
+
+              <div className="pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  disabled={uploading || deleting}
+                  onClick={() => setConfirmDelete(true)}
+                  className="w-full min-h-[44px] px-4 rounded-xl border border-red-200 bg-red-50/60 hover:bg-red-100 text-red-700 font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  <span>यह Excel शीट डिलीट करें</span>
+                </button>
               </div>
             </>
           )}

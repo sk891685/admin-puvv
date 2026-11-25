@@ -201,7 +201,7 @@ export default function App() {
   const navItems: Array<{ id: ActiveTab; label: string; icon: typeof Search }> = isAdmin
     ? [
         { id: 'search', label: 'डाटा खोजें', icon: Search },
-        { id: 'upload', label: 'Excel अपलोड', icon: FileUp },
+        { id: 'upload', label: 'Excel प्रबंधन', icon: FileUp },
         { id: 'users', label: 'यूज़र प्रबंधन', icon: Users },
       ]
     : [{ id: 'search', label: 'डाटा खोजें', icon: Search }];
