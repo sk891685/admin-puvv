@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Check, Pencil, Trash2, UserPlus, X } from 'lucide-react';
+import { Check, Eye, EyeOff, Mail, Pencil, Phone, Trash2, UserPlus, X } from 'lucide-react';
 import { createUser, deleteUser, fetchUsers, updateUser } from '../api';
 import type { User, UserRole } from '../types';
 import { formatHindiDateTime, ROLE_META } from '../types';
@@ -19,8 +19,11 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
 
   // Create form state
   const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('');
+  const [mobile, setMobile] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [role, setRole] = useState<UserRole>('lineman');
   const [supervisorId, setSupervisorId] = useState<string>('');
   const [creating, setCreating] = useState(false);
@@ -28,6 +31,8 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
   // Edit / Delete inline state
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [editFullName, setEditFullName] = useState('');
+  const [editEmail, setEditEmail] = useState('');
+  const [editMobile, setEditMobile] = useState('');
   const [editRole, setEditRole] = useState<UserRole>('lineman');
   const [editSupervisorId, setEditSupervisorId] = useState<string>('');
   const [editPassword, setEditPassword] = useState('');
@@ -63,18 +68,24 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
     try {
       const res = await createUser({
         fullName,
-        username,
+        email,
+        mobile,
+        username: username.trim() || undefined,
         password,
         role,
         supervisorId: role === 'lineman' && supervisorId ? Number(supervisorId) : null,
       });
       setUsers((prev) => [...prev, res.user]);
       setFullName('');
+      setEmail('');
+      setMobile('');
       setUsername('');
       setPassword('');
       setRole('lineman');
       setSupervisorId('');
-      onNotify(`नया यूज़र "${res.user.fullName}" (${ROLE_META[res.user.role].label}) बनाया गया।`);
+      onNotify(
+        `नया यूज़र "${res.user.fullName}" (User ID: ${res.user.username} · ${ROLE_META[res.user.role].label}) बनाया गया।`
+      );
       await loadUsers();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'यूज़र बनाने में त्रुटि हुई।');
@@ -86,6 +97,8 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
   function startEdit(u: User) {
     setEditingUser(u);
     setEditFullName(u.fullName);
+    setEditEmail(u.email);
+    setEditMobile(u.mobile);
     setEditRole(u.role);
     setEditSupervisorId(u.supervisorId ? String(u.supervisorId) : '');
     setEditPassword('');
@@ -100,6 +113,8 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
     try {
       await updateUser(editingUser.id, {
         fullName: editFullName,
+        email: editEmail,
+        mobile: editMobile,
         role: editRole,
         supervisorId: editRole === 'lineman' && editSupervisorId ? Number(editSupervisorId) : null,
         password: editPassword.trim() ? editPassword.trim() : undefined,
@@ -131,7 +146,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
       <div>
         <h1 className="text-xl sm:text-2xl font-bold text-slate-900">यूज़र और रोल प्रबंधन</h1>
         <p className="text-sm text-slate-600 mt-1">
-          Admin, JE, Supervisor और Lineman खाते बनाएं। Supervisor को अपने जुड़े हुए Lineman के रिमार्क दिखाई देते हैं।
+          ईमेल आईडी और मोबाइल नंबर के साथ नए Admin, JE, Supervisor और Lineman खाते बनाएँ।
         </p>
       </div>
 
@@ -166,34 +181,84 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
             </div>
 
             <div>
-              <label htmlFor="new-username" className="block text-sm font-semibold text-slate-800 mb-1">
-                यूज़र नाम (लॉगिन आईडी)
+              <label htmlFor="new-email" className="block text-sm font-semibold text-slate-800 mb-1">
+                ईमेल आईडी (Email)
               </label>
-              <input
-                id="new-username"
-                type="text"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="जैसे: suresh_lm"
-                className="w-full min-h-[46px] rounded-xl border border-slate-300 px-3.5 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
-              />
+              <div className="relative">
+                <Mail className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="new-email"
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="suresh@puvvnl.in"
+                  className="w-full min-h-[46px] rounded-xl border border-slate-300 pl-10 pr-3.5 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
+                />
+              </div>
             </div>
 
             <div>
-              <label htmlFor="new-password" className="block text-sm font-semibold text-slate-800 mb-1">
-                पासवर्ड
+              <label htmlFor="new-mobile" className="block text-sm font-semibold text-slate-800 mb-1">
+                मोबाइल नंबर (Mobile Number)
               </label>
-              <input
-                id="new-password"
-                type="password"
-                required
-                minLength={4}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="कम से कम 4 अक्षर"
-                className="w-full min-h-[46px] rounded-xl border border-slate-300 px-3.5 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
-              />
+              <div className="relative">
+                <Phone className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="new-mobile"
+                  type="tel"
+                  required
+                  value={mobile}
+                  onChange={(e) => setMobile(e.target.value)}
+                  placeholder="जैसे: 9839012345"
+                  className="w-full min-h-[46px] rounded-xl border border-slate-300 pl-10 pr-3.5 text-sm sm:text-base text-slate-900 tabular-nums focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="new-username" className="block text-sm font-semibold text-slate-800 mb-1">
+                  यूज़र आईडी (User ID)
+                </label>
+                <input
+                  id="new-username"
+                  type="text"
+                  required
+                  minLength={3}
+                  maxLength={32}
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="जैसे: suresh01"
+                  className="w-full min-h-[46px] rounded-xl border border-slate-300 px-3.5 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="new-password" className="block text-sm font-semibold text-slate-800 mb-1">
+                  पासवर्ड (Password)
+                </label>
+                <div className="relative">
+                  <input
+                    id="new-password"
+                    type={showNewPassword ? 'text' : 'password'}
+                    required
+                    minLength={4}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="कम से कम 4 अक्षर"
+                    className="w-full min-h-[46px] rounded-xl border border-slate-300 pl-3.5 pr-10 text-sm sm:text-base text-slate-900 focus:border-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-700/20"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowNewPassword((prev) => !prev)}
+                    aria-label={showNewPassword ? 'पासवर्ड छुपाएँ' : 'पासवर्ड देखें'}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-800 cursor-pointer"
+                  >
+                    {showNewPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+              </div>
             </div>
 
             <div>
@@ -231,7 +296,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
                   <option value="">कोई सुपरवाइज़र चयनित नहीं</option>
                   {supervisors.map((sup) => (
                     <option key={sup.id} value={sup.id}>
-                      {sup.fullName} (@{sup.username})
+                      {sup.fullName} ({sup.email || `@${sup.username}`})
                     </option>
                   ))}
                 </select>
@@ -314,6 +379,33 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
                         </div>
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-700 mb-1">
+                              ईमेल आईडी
+                            </label>
+                            <input
+                              type="email"
+                              value={editEmail}
+                              onChange={(e) => setEditEmail(e.target.value)}
+                              placeholder="example@puvvnl.in"
+                              className="w-full min-h-[42px] rounded-lg border border-slate-300 bg-white px-3 text-sm"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-semibold text-slate-700 mb-1">
+                              मोबाइल नंबर
+                            </label>
+                            <input
+                              type="tel"
+                              value={editMobile}
+                              onChange={(e) => setEditMobile(e.target.value)}
+                              placeholder="10 अंकों का मोबाइल नंबर"
+                              className="w-full min-h-[42px] rounded-lg border border-slate-300 bg-white px-3 text-sm tabular-nums"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                           {editRole === 'lineman' && (
                             <div>
                               <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -327,7 +419,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
                                 <option value="">कोई नहीं</option>
                                 {supervisors.map((sup) => (
                                   <option key={sup.id} value={sup.id}>
-                                    {sup.fullName} (@{sup.username})
+                                    {sup.fullName} ({sup.email || `@${sup.username}`})
                                   </option>
                                 ))}
                               </select>
@@ -382,23 +474,38 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
                               <span className="text-xs font-medium text-blue-700">(आप)</span>
                             )}
                           </div>
+
                           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-600 tabular-nums">
                             <span className="font-semibold text-slate-800">
                               {ROLE_META[u.role].hindiLabel}
                             </span>
-                            {u.role === 'lineman' && (
+                            {u.email && (
                               <>
                                 <span aria-hidden="true">·</span>
+                                <span className="break-all">{u.email}</span>
+                              </>
+                            )}
+                            {u.mobile && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span className="font-mono-tabular">{u.mobile}</span>
+                              </>
+                            )}
+                          </div>
+
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-500 tabular-nums">
+                            {u.role === 'lineman' && (
+                              <>
                                 <span>
                                   सुपरवाइज़र:{' '}
-                                  <strong className="font-medium text-slate-800">
+                                  <strong className="font-medium text-slate-700">
                                     {u.supervisorName ?? 'तय नहीं'}
                                   </strong>
                                 </span>
+                                <span aria-hidden="true">·</span>
                               </>
                             )}
-                            <span aria-hidden="true">·</span>
-                            <span className="text-slate-500">{formatHindiDateTime(u.createdAt)}</span>
+                            <span>{formatHindiDateTime(u.createdAt)}</span>
                           </div>
                         </div>
 

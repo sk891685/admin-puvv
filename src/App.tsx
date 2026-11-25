@@ -105,7 +105,9 @@ export default function App() {
     setDatasetQuery(DEFAULT_QUERY);
     setActiveTab('search');
     setAuthStatus((prev) =>
-      prev ? { ...prev, needsAdminSetup: false } : { needsAdminSetup: false, envAdminConfigured: false }
+      prev
+        ? { ...prev, needsAdminSetup: false }
+        : { needsAdminSetup: false, envAdminConfigured: false, smtpConfigured: false }
     );
   }
 

@@ -8,6 +8,8 @@ export type UserRole = 'admin' | 'je' | 'supervisor' | 'lineman';
 export interface DbUser {
   id: number;
   username: string;
+  email: string;
+  mobile: string;
   full_name: string;
   password_hash: string;
   role: UserRole;
@@ -18,6 +20,8 @@ export interface DbUser {
 export interface SafeUser {
   id: number;
   username: string;
+  email: string;
+  mobile: string;
   fullName: string;
   role: UserRole;
   supervisorId: number | null;
@@ -142,7 +146,74 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_remarks_dataset_row ON remarks(dataset_id, row_id);
   CREATE INDEX IF NOT EXISTS idx_remarks_user ON remarks(user_id);
+
+  CREATE TABLE IF NOT EXISTS login_otps (
+    challenge_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    otp_hash TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_login_otps_user ON login_otps(user_id);
+
+  CREATE TABLE IF NOT EXISTS login_preauth (
+    preauth_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_login_preauth_user ON login_preauth(user_id);
 `);
+
+// Safe idempotent migration for email and mobile columns on existing databases
+const existingUserCols = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+if (!existingUserCols.some((c) => c.name === 'email')) {
+  db.exec("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''");
+}
+if (!existingUserCols.some((c) => c.name === 'mobile')) {
+  db.exec("ALTER TABLE users ADD COLUMN mobile TEXT NOT NULL DEFAULT ''");
+}
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+  ON users(lower(email))
+  WHERE email IS NOT NULL AND trim(email) != '';
+`);
+
+export function isValidEmail(value: string): boolean {
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed.length < 5 || trimmed.length > 120) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(trimmed);
+}
+
+export function normalizeMobile(value: string): string | null {
+  const digits = value.replace(/[\s\-()]/g, '').replace(/^\+91/, '').replace(/^0(?=\d{10}$)/, '');
+  if (/^[6-9]\d{9}$/.test(digits)) return digits;
+  const rawPlusDigits = value.replace(/[\s\-()]/g, '').replace(/^\+/, '');
+  if (/^\d{10,15}$/.test(rawPlusDigits)) return rawPlusDigits;
+  return null;
+}
+
+export function deriveUniqueUsername(email: string, preferred?: string): string {
+  const baseRaw =
+    preferred && preferred.trim()
+      ? preferred.trim().toLowerCase()
+      : email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  const base = (baseRaw.length >= 3 ? baseRaw : `user_${baseRaw || 'acc'}`).slice(0, 26);
+
+  let candidate = base;
+  let counter = 1;
+  while (
+    db.prepare('SELECT 1 FROM users WHERE lower(username) = ?').get(candidate) !== undefined
+  ) {
+    counter += 1;
+    candidate = `${base.slice(0, 24)}_${counter}`;
+  }
+  return candidate;
+}
 
 export function hashPassword(password: string): string {
   const salt = crypto.randomBytes(16).toString('hex');
@@ -167,23 +238,29 @@ function timingSafeStringCompare(a: string, b: string): boolean {
   return crypto.timingSafeEqual(hashA, hashB);
 }
 
-export function getEnvAdminConfig(): { username: string; password: string } | null {
+export function getEnvAdminConfig(): {
+  username: string;
+  email: string;
+  password: string;
+} | null {
   const rawPass = process.env.ADMIN_PASSWORD?.trim();
   if (!rawPass) return null;
   const envPass = rawPass.replace(/^["']|["']$/g, '').trim();
   if (
     !envPass ||
-    /^MY_/i.test(envPass) ||
-    /^YOUR_/i.test(envPass) ||
-    /^CHANGE_ME/i.test(envPass) ||
+    envPass.length < 6 ||
+    /^(MY_|YOUR_|CHANGE_ME|PLACEHOLDER|DUMMY|EXAMPLE|NOT_SET)/i.test(envPass) ||
     envPass === 'undefined' ||
     envPass === 'null'
   ) {
     return null;
   }
   const rawUser = process.env.ADMIN_USERNAME?.trim().replace(/^["']|["']$/g, '').trim();
-  const envUser = rawUser && !/^MY_/i.test(rawUser) ? rawUser.toLowerCase() : 'admin';
-  return { username: envUser, password: envPass };
+  const envUser =
+    rawUser && !/^(MY_|YOUR_|CHANGE_ME|PLACEHOLDER)/i.test(rawUser) ? rawUser.toLowerCase() : 'admin';
+  const rawEmail = process.env.ADMIN_EMAIL?.trim().replace(/^["']|["']$/g, '').trim();
+  const envEmail = rawEmail && isValidEmail(rawEmail) ? rawEmail.toLowerCase() : '';
+  return { username: envUser, email: envEmail, password: envPass };
 }
 
 export function countAdmins(): number {
@@ -192,13 +269,14 @@ export function countAdmins(): number {
 }
 
 export function needsAdminSetup(): boolean {
-  if (getEnvAdminConfig()) return false;
   return countAdmins() === 0;
 }
 
 function mapSafeUser(row: {
   id: number;
   username: string;
+  email: string | null;
+  mobile: string | null;
   full_name: string;
   role: UserRole;
   supervisor_id: number | null;
@@ -208,6 +286,8 @@ function mapSafeUser(row: {
   return {
     id: row.id,
     username: row.username,
+    email: row.email ?? '',
+    mobile: row.mobile ?? '',
     fullName: row.full_name,
     role: row.role,
     supervisorId: row.supervisor_id,
@@ -219,7 +299,7 @@ function mapSafeUser(row: {
 export function getUserById(userId: number): SafeUser | null {
   const row = db
     .prepare(
-      `SELECT u.id, u.username, u.full_name, u.role, u.supervisor_id, s.full_name AS supervisor_name, u.created_at
+      `SELECT u.id, u.username, u.email, u.mobile, u.full_name, u.role, u.supervisor_id, s.full_name AS supervisor_name, u.created_at
        FROM users u
        LEFT JOIN users s ON u.supervisor_id = s.id
        WHERE u.id = ?`
@@ -228,6 +308,8 @@ export function getUserById(userId: number): SafeUser | null {
     | {
         id: number;
         username: string;
+        email: string | null;
+        mobile: string | null;
         full_name: string;
         role: UserRole;
         supervisor_id: number | null;
@@ -238,10 +320,19 @@ export function getUserById(userId: number): SafeUser | null {
   return row ? mapSafeUser(row) : null;
 }
 
+export function findUserByEmail(emailInput: string): SafeUser | null {
+  const normalized = emailInput.trim().toLowerCase();
+  if (!normalized || !isValidEmail(normalized)) return null;
+  const row = db
+    .prepare('SELECT id FROM users WHERE lower(email) = ?')
+    .get(normalized) as { id: number } | undefined;
+  return row ? getUserById(row.id) : null;
+}
+
 export function listUsers(): SafeUser[] {
   const rows = db
     .prepare(
-      `SELECT u.id, u.username, u.full_name, u.role, u.supervisor_id, s.full_name AS supervisor_name, u.created_at
+      `SELECT u.id, u.username, u.email, u.mobile, u.full_name, u.role, u.supervisor_id, s.full_name AS supervisor_name, u.created_at
        FROM users u
        LEFT JOIN users s ON u.supervisor_id = s.id
        ORDER BY
@@ -256,6 +347,8 @@ export function listUsers(): SafeUser[] {
     .all() as Array<{
     id: number;
     username: string;
+    email: string | null;
+    mobile: string | null;
     full_name: string;
     role: UserRole;
     supervisor_id: number | null;
@@ -266,7 +359,13 @@ export function listUsers(): SafeUser[] {
 }
 
 const claimFirstAdminTxn = db.transaction(
-  (username: string, fullName: string, passwordHash: string): SafeUser => {
+  (
+    username: string,
+    email: string,
+    mobile: string,
+    fullName: string,
+    passwordHash: string
+  ): SafeUser => {
     const existingAdmins = db
       .prepare("SELECT COUNT(*) AS cnt FROM users WHERE role = 'admin'")
       .get() as { cnt: number };
@@ -276,10 +375,10 @@ const claimFirstAdminTxn = db.transaction(
     const now = new Date().toISOString();
     const info = db
       .prepare(
-        `INSERT INTO users (username, full_name, password_hash, role, supervisor_id, created_at)
-         VALUES (?, ?, ?, 'admin', NULL, ?)`
+        `INSERT INTO users (username, email, mobile, full_name, password_hash, role, supervisor_id, created_at)
+         VALUES (?, ?, ?, ?, ?, 'admin', NULL, ?)`
       )
-      .run(username, fullName, passwordHash, now);
+      .run(username, email, mobile, fullName, passwordHash, now);
     const created = getUserById(Number(info.lastInsertRowid));
     if (!created) {
       throw new Error('FAILED_TO_CREATE_ADMIN');
@@ -290,49 +389,216 @@ const claimFirstAdminTxn = db.transaction(
 
 export function claimFirstAdmin(input: {
   username: string;
+  email: string;
+  mobile: string;
   fullName: string;
   password: string;
 }): SafeUser {
-  if (getEnvAdminConfig()) {
-    throw new Error('ADMIN_ENV_CONFIGURED');
-  }
   const passwordHash = hashPassword(input.password);
-  return claimFirstAdminTxn(input.username, input.fullName, passwordHash);
+  return claimFirstAdminTxn(
+    input.username.trim().toLowerCase(),
+    input.email.trim().toLowerCase(),
+    input.mobile,
+    input.fullName,
+    passwordHash
+  );
 }
 
-export function authenticateUser(usernameInput: string, passwordInput: string): SafeUser | null {
-  const normalizedUsername = usernameInput.trim().toLowerCase();
-  if (!normalizedUsername || !passwordInput) return null;
+export function authenticateUser(identifierInput: string, passwordInput: string): SafeUser | null {
+  const normalized = identifierInput.trim().toLowerCase();
+  if (!normalized || !passwordInput) return null;
 
   const envAdmin = getEnvAdminConfig();
-  if (envAdmin && normalizedUsername === envAdmin.username) {
+  const matchesEnvAdmin =
+    envAdmin !== null &&
+    (normalized === envAdmin.username || (envAdmin.email !== '' && normalized === envAdmin.email));
+
+  if (envAdmin && matchesEnvAdmin) {
     if (!timingSafeStringCompare(passwordInput, envAdmin.password)) {
       return null;
     }
     const existing = db
-      .prepare('SELECT id FROM users WHERE lower(username) = ?')
-      .get(normalizedUsername) as { id: number } | undefined;
+      .prepare('SELECT id FROM users WHERE lower(username) = ? OR (email != \'\' AND lower(email) = ?)')
+      .get(envAdmin.username, envAdmin.email || envAdmin.username) as { id: number } | undefined;
     if (existing) {
-      db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(existing.id);
+      if (envAdmin.email) {
+        db.prepare("UPDATE users SET role = 'admin', email = CASE WHEN trim(email) = '' THEN ? ELSE email END WHERE id = ?").run(
+          envAdmin.email,
+          existing.id
+        );
+      } else {
+        db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(existing.id);
+      }
       return getUserById(existing.id);
     }
     const now = new Date().toISOString();
     const placeholderHash = hashPassword(crypto.randomBytes(24).toString('hex'));
     const info = db
       .prepare(
-        `INSERT INTO users (username, full_name, password_hash, role, supervisor_id, created_at)
-         VALUES (?, ?, ?, 'admin', NULL, ?)`
+        `INSERT INTO users (username, email, mobile, full_name, password_hash, role, supervisor_id, created_at)
+         VALUES (?, ?, '', ?, ?, 'admin', NULL, ?)`
       )
-      .run(normalizedUsername, 'मुख्य एडमिन', placeholderHash, now);
+      .run(envAdmin.username, envAdmin.email, 'मुख्य एडमिन', placeholderHash, now);
     return getUserById(Number(info.lastInsertRowid));
   }
 
   const row = db
-    .prepare('SELECT id, username, full_name, password_hash, role, supervisor_id, created_at FROM users WHERE lower(username) = ?')
-    .get(normalizedUsername) as DbUser | undefined;
+    .prepare(
+      `SELECT id, username, email, mobile, full_name, password_hash, role, supervisor_id, created_at
+       FROM users
+       WHERE (email != '' AND lower(email) = ?) OR lower(username) = ?`
+    )
+    .get(normalized, normalized) as DbUser | undefined;
   if (!row) return null;
   if (!verifyPassword(passwordInput, row.password_hash)) return null;
   return getUserById(row.id);
+}
+
+// --- Email OTP Challenge Management ---
+
+function hashOtp(otp: string, salt: string): string {
+  return crypto.createHash('sha256').update(`${salt}:${otp}`).digest('hex');
+}
+
+export function createLoginOtpChallenge(userId: number, email: string): {
+  challengeId: string;
+  otp: string;
+  expiresInSeconds: number;
+} {
+  const now = new Date();
+  const expiresInSeconds = 300; // 5 minutes
+  const expiresAt = new Date(now.getTime() + expiresInSeconds * 1000).toISOString();
+  const challengeId = crypto.randomUUID();
+  const otp = String(crypto.randomInt(100000, 1000000));
+  const salt = crypto.randomBytes(12).toString('hex');
+  const otpHash = `${salt}:${hashOtp(otp, salt)}`;
+
+  // Clear expired challenges and prior pending challenges for this user
+  db.prepare('DELETE FROM login_otps WHERE expires_at < ? OR user_id = ?').run(now.toISOString(), userId);
+  db.prepare(
+    `INSERT INTO login_otps (challenge_id, user_id, email, otp_hash, attempts, created_at, expires_at)
+     VALUES (?, ?, ?, ?, 0, ?, ?)`
+  ).run(challengeId, userId, email.toLowerCase(), otpHash, now.toISOString(), expiresAt);
+
+  return { challengeId, otp, expiresInSeconds };
+}
+
+export function createLoginPreAuth(userId: number): { preAuthId: string; expiresInSeconds: number } {
+  const now = new Date();
+  const expiresInSeconds = 300;
+  const expiresAt = new Date(now.getTime() + expiresInSeconds * 1000).toISOString();
+  const preAuthId = crypto.randomUUID();
+
+  db.prepare('DELETE FROM login_preauth WHERE expires_at < ? OR user_id = ?').run(now.toISOString(), userId);
+  db.prepare(
+    `INSERT INTO login_preauth (preauth_id, user_id, created_at, expires_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(preAuthId, userId, now.toISOString(), expiresAt);
+
+  return { preAuthId, expiresInSeconds };
+}
+
+export function getLoginPreAuthUser(preAuthId: string): SafeUser | null {
+  const row = db
+    .prepare('SELECT user_id, expires_at FROM login_preauth WHERE preauth_id = ?')
+    .get(preAuthId) as { user_id: number; expires_at: string } | undefined;
+  if (!row) return null;
+  if (row.expires_at < new Date().toISOString()) {
+    db.prepare('DELETE FROM login_preauth WHERE preauth_id = ?').run(preAuthId);
+    return null;
+  }
+  return getUserById(row.user_id);
+}
+
+export function deleteLoginPreAuth(preAuthId: string): void {
+  db.prepare('DELETE FROM login_preauth WHERE preauth_id = ?').run(preAuthId);
+}
+
+export function getOtpChallengeMeta(challengeId: string): {
+  userId: number;
+  email: string;
+  createdAtMs: number;
+  expiresAt: string;
+} | null {
+  const row = db
+    .prepare('SELECT user_id, email, created_at, expires_at FROM login_otps WHERE challenge_id = ?')
+    .get(challengeId) as
+    | { user_id: number; email: string; created_at: string; expires_at: string }
+    | undefined;
+  if (!row) return null;
+  return {
+    userId: row.user_id,
+    email: row.email,
+    createdAtMs: Date.parse(row.created_at) || 0,
+    expiresAt: row.expires_at,
+  };
+}
+
+export function verifyLoginOtpChallenge(challengeId: string, otpInput: string): SafeUser {
+  const row = db
+    .prepare('SELECT challenge_id, user_id, email, otp_hash, attempts, expires_at FROM login_otps WHERE challenge_id = ?')
+    .get(challengeId) as
+    | {
+        challenge_id: string;
+        user_id: number;
+        email: string;
+        otp_hash: string;
+        attempts: number;
+        expires_at: string;
+      }
+    | undefined;
+
+  if (!row) {
+    throw new Error('OTP_NOT_FOUND');
+  }
+  const nowIso = new Date().toISOString();
+  if (row.expires_at < nowIso) {
+    db.prepare('DELETE FROM login_otps WHERE challenge_id = ?').run(challengeId);
+    throw new Error('OTP_EXPIRED');
+  }
+  if (row.attempts >= 5) {
+    db.prepare('DELETE FROM login_otps WHERE challenge_id = ?').run(challengeId);
+    throw new Error('OTP_MAX_ATTEMPTS');
+  }
+
+  const [salt, expectedHex] = row.otp_hash.split(':');
+  const cleanOtp = otpInput.trim();
+  const actualHex = salt ? hashOtp(cleanOtp, salt) : '';
+  const match =
+    Boolean(salt && expectedHex && actualHex.length === expectedHex.length) &&
+    crypto.timingSafeEqual(Buffer.from(actualHex, 'hex'), Buffer.from(expectedHex, 'hex'));
+
+  if (!match) {
+    const nextAttempts = row.attempts + 1;
+    if (nextAttempts >= 5) {
+      db.prepare('DELETE FROM login_otps WHERE challenge_id = ?').run(challengeId);
+      throw new Error('OTP_MAX_ATTEMPTS');
+    }
+    db.prepare('UPDATE login_otps SET attempts = ? WHERE challenge_id = ?').run(nextAttempts, challengeId);
+    throw new Error('OTP_INVALID');
+  }
+
+  // Single-use OTP: delete immediately upon verification
+  db.prepare('DELETE FROM login_otps WHERE challenge_id = ?').run(challengeId);
+
+  // If account had no email saved yet (e.g. legacy/env admin), persist the verified email
+  if (row.email && isValidEmail(row.email)) {
+    const currentEmailRow = db
+      .prepare('SELECT email FROM users WHERE id = ?')
+      .get(row.user_id) as { email: string } | undefined;
+    if (currentEmailRow && !currentEmailRow.email.trim()) {
+      const takenByOther = db
+        .prepare("SELECT id FROM users WHERE id != ? AND email != '' AND lower(email) = ?")
+        .get(row.user_id, row.email.toLowerCase()) as { id: number } | undefined;
+      if (!takenByOther) {
+        db.prepare('UPDATE users SET email = ? WHERE id = ?').run(row.email.toLowerCase(), row.user_id);
+      }
+    }
+  }
+
+  const user = getUserById(row.user_id);
+  if (!user) throw new Error('USER_NOT_FOUND');
+  return user;
 }
 
 export function createSession(userId: number): string {
@@ -373,17 +639,28 @@ export function revokeSession(rawToken: string): void {
 
 export function createUserAccount(input: {
   username: string;
+  email: string;
+  mobile: string;
   fullName: string;
   password: string;
   role: UserRole;
   supervisorId: number | null;
 }): SafeUser {
   const normalizedUsername = input.username.trim().toLowerCase();
-  const existing = db
+  const normalizedEmail = input.email.trim().toLowerCase();
+
+  const existingUser = db
     .prepare('SELECT id FROM users WHERE lower(username) = ?')
     .get(normalizedUsername) as { id: number } | undefined;
-  if (existing) {
+  if (existingUser) {
     throw new Error('USERNAME_TAKEN');
+  }
+
+  const existingEmail = db
+    .prepare("SELECT id FROM users WHERE email != '' AND lower(email) = ?")
+    .get(normalizedEmail) as { id: number } | undefined;
+  if (existingEmail) {
+    throw new Error('EMAIL_TAKEN');
   }
 
   let validatedSupervisorId: number | null = null;
@@ -401,10 +678,19 @@ export function createUserAccount(input: {
   const passwordHash = hashPassword(input.password);
   const info = db
     .prepare(
-      `INSERT INTO users (username, full_name, password_hash, role, supervisor_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO users (username, email, mobile, full_name, password_hash, role, supervisor_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(normalizedUsername, input.fullName.trim(), passwordHash, input.role, validatedSupervisorId, now);
+    .run(
+      normalizedUsername,
+      normalizedEmail,
+      input.mobile,
+      input.fullName.trim(),
+      passwordHash,
+      input.role,
+      validatedSupervisorId,
+      now
+    );
 
   const created = getUserById(Number(info.lastInsertRowid));
   if (!created) throw new Error('CREATE_FAILED');
@@ -415,6 +701,8 @@ export function updateUserAccount(
   targetId: number,
   updates: {
     fullName?: string;
+    email?: string;
+    mobile?: string;
     role?: UserRole;
     supervisorId?: number | null;
     password?: string;
@@ -429,6 +717,20 @@ export function updateUserAccount(
     if (target.id === actorId) throw new Error('CANNOT_DEMOTE_SELF');
     if (countAdmins() <= 1) throw new Error('LAST_ADMIN');
   }
+
+  let nextEmail = target.email;
+  if (updates.email !== undefined) {
+    const cleaned = updates.email.trim().toLowerCase();
+    if (cleaned !== '') {
+      const dup = db
+        .prepare("SELECT id FROM users WHERE email != '' AND lower(email) = ? AND id != ?")
+        .get(cleaned, targetId) as { id: number } | undefined;
+      if (dup) throw new Error('EMAIL_TAKEN');
+    }
+    nextEmail = cleaned;
+  }
+
+  const nextMobile = updates.mobile !== undefined ? updates.mobile : target.mobile;
 
   let nextSupervisorId: number | null = target.supervisorId;
   if (nextRole !== 'lineman') {
@@ -449,20 +751,13 @@ export function updateUserAccount(
 
   if (updates.password && updates.password.length >= 4) {
     const newHash = hashPassword(updates.password);
-    db.prepare('UPDATE users SET full_name = ?, role = ?, supervisor_id = ?, password_hash = ? WHERE id = ?').run(
-      nextFullName,
-      nextRole,
-      nextSupervisorId,
-      newHash,
-      targetId
-    );
+    db.prepare(
+      'UPDATE users SET full_name = ?, email = ?, mobile = ?, role = ?, supervisor_id = ?, password_hash = ? WHERE id = ?'
+    ).run(nextFullName, nextEmail, nextMobile, nextRole, nextSupervisorId, newHash, targetId);
   } else {
-    db.prepare('UPDATE users SET full_name = ?, role = ?, supervisor_id = ? WHERE id = ?').run(
-      nextFullName,
-      nextRole,
-      nextSupervisorId,
-      targetId
-    );
+    db.prepare(
+      'UPDATE users SET full_name = ?, email = ?, mobile = ?, role = ?, supervisor_id = ? WHERE id = ?'
+    ).run(nextFullName, nextEmail, nextMobile, nextRole, nextSupervisorId, targetId);
   }
 
   const updated = getUserById(targetId);

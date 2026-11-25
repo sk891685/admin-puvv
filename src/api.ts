@@ -2,6 +2,8 @@ import type {
   AuthStatus,
   DatasetInfo,
   DatasetPayload,
+  LoginResponse,
+  OtpChallenge,
   RemarkFilterMode,
   RemarkItem,
   UploadProgress,
@@ -55,7 +57,9 @@ export async function fetchAuthStatus(): Promise<AuthStatus> {
 }
 
 export async function setupFirstAdmin(input: {
-  username: string;
+  username?: string;
+  email: string;
+  mobile: string;
   fullName: string;
   password: string;
 }): Promise<{ token: string; user: User }> {
@@ -68,10 +72,37 @@ export async function setupFirstAdmin(input: {
 export async function loginWithPassword(
   username: string,
   password: string
-): Promise<{ token: string; user: User }> {
-  return apiFetch<{ token: string; user: User }>('/api/auth/login', {
+): Promise<LoginResponse> {
+  return apiFetch<LoginResponse>('/api/auth/login', {
     method: 'POST',
     body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function sendStep2GmailOtp(
+  preAuthId: string,
+  email: string
+): Promise<OtpChallenge> {
+  return apiFetch<OtpChallenge>('/api/auth/step2-send-otp', {
+    method: 'POST',
+    body: JSON.stringify({ preAuthId, email }),
+  });
+}
+
+export async function resendEmailOtp(challengeId: string): Promise<OtpChallenge> {
+  return apiFetch<OtpChallenge>('/api/auth/resend-otp', {
+    method: 'POST',
+    body: JSON.stringify({ challengeId }),
+  });
+}
+
+export async function verifyEmailOtp(
+  challengeId: string,
+  otp: string
+): Promise<{ token: string; user: User }> {
+  return apiFetch<{ token: string; user: User }>('/api/auth/verify-otp', {
+    method: 'POST',
+    body: JSON.stringify({ challengeId, otp }),
   });
 }
 
@@ -291,7 +322,9 @@ export async function fetchUsers(): Promise<{ users: User[] }> {
 }
 
 export async function createUser(input: {
-  username: string;
+  username?: string;
+  email: string;
+  mobile: string;
   fullName: string;
   password: string;
   role: UserRole;
@@ -307,6 +340,8 @@ export async function updateUser(
   userId: number,
   input: {
     fullName?: string;
+    email?: string;
+    mobile?: string;
     role?: UserRole;
     supervisorId?: number | null;
     password?: string;
