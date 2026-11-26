@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
-import { Download, FileSpreadsheet, FileUp, Sparkles, Trash2, X } from 'lucide-react';
+import { Download, FileSpreadsheet, FileUp, HardDrive, Sparkles, Trash2, X } from 'lucide-react';
 import {
   deleteActiveDataset,
   downloadExcelWithRemarks,
@@ -17,6 +17,7 @@ interface UploadPanelProps {
   onDatasetChanged: () => Promise<void>;
   onNotify: (message: string) => void;
   onOpenSearch: () => void;
+  onOpenDrive?: () => void;
 }
 
 export function UploadPanel({
@@ -25,6 +26,7 @@ export function UploadPanel({
   onDatasetChanged,
   onNotify,
   onOpenSearch,
+  onOpenDrive,
 }: UploadPanelProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -422,6 +424,17 @@ export function UploadPanel({
                   <FileSpreadsheet className="h-5 w-5" />
                   <span>{uploading ? 'लोड हो रहा है...' : 'फ़ाइल चुनें और अपलोड करें'}</span>
                 </button>
+                {onOpenDrive && (
+                  <button
+                    type="button"
+                    disabled={uploading || deleting}
+                    onClick={onOpenDrive}
+                    className="w-full sm:w-auto min-h-[48px] px-5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-60 text-slate-800 font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+                  >
+                    <HardDrive className="h-4 w-4 text-blue-700" />
+                    <span>Google Drive से चुनें</span>
+                  </button>
+                )}
               </div>
             )}
           </div>

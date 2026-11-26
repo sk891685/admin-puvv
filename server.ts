@@ -9,23 +9,16 @@ import {
   addRemark,
   authenticateUser,
   claimFirstAdmin,
-  createLoginOtpChallenge,
-  createLoginPreAuth,
   createSession,
   createUserAccount,
   deleteActiveDataset,
-  deleteLoginPreAuth,
   deleteRemark,
   deleteUserAccount,
   deriveUniqueUsername,
-  findUserByEmail,
   getActiveDataset,
   getAllRemarksByRowAdmin,
   getDistinctColumnValues,
   getEnvAdminConfig,
-  getLoginPreAuthUser,
-  getOtpChallengeMeta,
-  getUserById,
   getUserBySessionToken,
   isValidEmail,
   isValidRole,
@@ -38,7 +31,6 @@ import {
   saveNewDataset,
   updateOwnRemark,
   updateUserAccount,
-  verifyLoginOtpChallenge,
 } from './server/db.ts';
 import type { SafeUser } from './server/db.ts';
 import {
@@ -47,7 +39,6 @@ import {
   streamExportWorkbookToResponse,
   streamImportSpreadsheetFromFile,
 } from './server/excel.ts';
-import { isSmtpConfigured, maskEmail, sendLoginOtpEmail } from './server/mailer.ts';
 
 interface AuthedRequest extends Request {
   currentUser?: SafeUser;
@@ -176,7 +167,6 @@ async function startServer(): Promise<void> {
     res.json({
       needsAdminSetup: needsAdminSetup(),
       envAdminConfigured: Boolean(envAdmin),
-      smtpConfigured: isSmtpConfigured(),
     });
   });
 
@@ -245,7 +235,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  app.post('/api/auth/login', async (req: Request, res: Response) => {
+  app.post('/api/auth/login', (req: Request, res: Response) => {
     const clientIp = req.ip || 'unknown';
     if (!checkLoginRateLimit(clientIp)) {
       res.status(429).json({ error: 'बहुत अधिक प्रयास किए गए। कृपया 1 मिनट बाद पुनः प्रयास करें।' });
@@ -254,195 +244,17 @@ async function startServer(): Promise<void> {
     const { email, username, password } = req.body ?? {};
     const identifier = typeof username === 'string' && username.trim() ? username : email;
     if (typeof identifier !== 'string' || typeof password !== 'string') {
-      res.status(400).json({ error: 'यूज़र नाम और पासवर्ड आवश्यक हैं।' });
+      res.status(400).json({ error: 'यूज़र आईडी और पासवर्ड आवश्यक हैं।' });
       return;
     }
     const user = authenticateUser(identifier, password);
     if (!user) {
-      res.status(401).json({ error: 'यूज़र नाम या पासवर्ड गलत है।' });
+      res.status(401).json({ error: 'यूज़र आईडी या पासवर्ड गलत है।' });
       return;
     }
 
-    // Step 2 Verification: Gmail OTP is required before creating a session
-    if (!isSmtpConfigured()) {
-      res.json({
-        step: 'smtp_setup_required',
-        maskedEmail: user.email && isValidEmail(user.email) ? maskEmail(user.email) : '',
-      });
-      return;
-    }
-
-    // If account has no saved email yet (e.g. existing admin), ask for Gmail in Step 2
-    if (!user.email || !isValidEmail(user.email)) {
-      const preAuth = createLoginPreAuth(user.id);
-      res.json({
-        step: 'gmail_required',
-        preAuthId: preAuth.preAuthId,
-        expiresInSeconds: preAuth.expiresInSeconds,
-      });
-      return;
-    }
-
-    try {
-      const challenge = createLoginOtpChallenge(user.id, user.email);
-      await sendLoginOtpEmail({
-        to: user.email,
-        fullName: user.fullName,
-        otp: challenge.otp,
-      });
-      res.json({
-        step: 'otp_verify',
-        challengeId: challenge.challengeId,
-        maskedEmail: maskEmail(user.email),
-        expiresInSeconds: challenge.expiresInSeconds,
-      });
-    } catch {
-      res.status(502).json({
-        error: 'Gmail पर OTP भेजने में समस्या आई। कृपया Gmail SMTP सेटिंग्स जांचें या पुनः प्रयास करें।',
-      });
-    }
-  });
-
-  app.post('/api/auth/step2-send-otp', async (req: Request, res: Response) => {
-    const clientIp = req.ip || 'unknown';
-    if (!checkLoginRateLimit(clientIp)) {
-      res.status(429).json({ error: 'बहुत अधिक प्रयास किए गए। कृपया 1 मिनट बाद पुनः प्रयास करें।' });
-      return;
-    }
-    if (!isSmtpConfigured()) {
-      res.status(503).json({
-        error: 'Gmail पर OTP भेजने के लिए Settings → Secrets में GMAIL_USER और GMAIL_APP_PASSWORD सेट करें।',
-      });
-      return;
-    }
-    const { preAuthId, email } = req.body ?? {};
-    if (typeof preAuthId !== 'string' || !UUID_REGEX.test(preAuthId)) {
-      res.status(400).json({ error: 'सेशन समाप्त हो गया है। कृपया पुनः लॉगिन करें।' });
-      return;
-    }
-    if (typeof email !== 'string' || !isValidEmail(email)) {
-      res.status(400).json({ error: 'कृपया एक मान्य Gmail/ईमेल पता दर्ज करें।' });
-      return;
-    }
-    const user = getLoginPreAuthUser(preAuthId);
-    if (!user) {
-      res.status(401).json({ error: 'वेरिफिकेशन सेशन समाप्त हो गया है। कृपया दोबारा लॉगिन करें।' });
-      return;
-    }
-    if (user.email && isValidEmail(user.email)) {
-      res.status(409).json({ error: 'इस खाते में ईमेल पहले से पंजीकृत है। कृपया पुनः लॉगिन करें।' });
-      return;
-    }
-    const cleanEmail = email.trim().toLowerCase();
-    const existingOwner = findUserByEmail(cleanEmail);
-    if (existingOwner && existingOwner.id !== user.id) {
-      res.status(409).json({ error: 'यह ईमेल आईडी किसी अन्य खाते में पंजीकृत है।' });
-      return;
-    }
-
-    try {
-      const challenge = createLoginOtpChallenge(user.id, cleanEmail);
-      await sendLoginOtpEmail({
-        to: cleanEmail,
-        fullName: user.fullName,
-        otp: challenge.otp,
-      });
-      deleteLoginPreAuth(preAuthId);
-      res.json({
-        step: 'otp_verify',
-        challengeId: challenge.challengeId,
-        maskedEmail: maskEmail(cleanEmail),
-        expiresInSeconds: challenge.expiresInSeconds,
-      });
-    } catch {
-      res.status(502).json({
-        error: 'Gmail पर OTP भेजने में त्रुटि हुई। कृपया Gmail SMTP सेटिंग्स जांचें।',
-      });
-    }
-  });
-
-  app.post('/api/auth/resend-otp', async (req: Request, res: Response) => {
-    const clientIp = req.ip || 'unknown';
-    if (!checkLoginRateLimit(clientIp)) {
-      res.status(429).json({ error: 'कृपया थोड़ी देर बाद पुनः प्रयास करें।' });
-      return;
-    }
-    if (!isSmtpConfigured()) {
-      res.status(503).json({ error: 'Gmail OTP सेवा कॉन्फ़िगर नहीं है।' });
-      return;
-    }
-    const { challengeId } = req.body ?? {};
-    if (typeof challengeId !== 'string' || !UUID_REGEX.test(challengeId)) {
-      res.status(400).json({ error: 'अमान्य OTP अनुरोध।' });
-      return;
-    }
-    const meta = getOtpChallengeMeta(challengeId);
-    if (!meta) {
-      res.status(404).json({ error: 'OTP सेशन समाप्त हो गया है। कृपया दोबारा लॉगिन शुरू करें।' });
-      return;
-    }
-    if (Date.now() - meta.createdAtMs < 25_000) {
-      res.status(429).json({ error: 'कृपया नया OTP भेजने से पहले 30 सेकंड प्रतीक्षा करें।' });
-      return;
-    }
-    const user = getUserById(meta.userId);
-    const targetEmail = meta.email && isValidEmail(meta.email) ? meta.email : user?.email || '';
-    if (!user || !targetEmail) {
-      res.status(404).json({ error: 'खाता उपलब्ध नहीं है।' });
-      return;
-    }
-    try {
-      const fresh = createLoginOtpChallenge(user.id, targetEmail);
-      await sendLoginOtpEmail({
-        to: targetEmail,
-        fullName: user.fullName,
-        otp: fresh.otp,
-      });
-      res.json({
-        challengeId: fresh.challengeId,
-        maskedEmail: maskEmail(targetEmail),
-        expiresInSeconds: fresh.expiresInSeconds,
-      });
-    } catch {
-      res.status(502).json({ error: 'OTP पुनः भेजने में त्रुटि हुई।' });
-    }
-  });
-
-  app.post('/api/auth/verify-otp', (req: Request, res: Response) => {
-    const clientIp = req.ip || 'unknown';
-    if (!checkLoginRateLimit(clientIp)) {
-      res.status(429).json({ error: 'बहुत अधिक प्रयास किए गए। कृपया 1 मिनट बाद पुनः प्रयास करें।' });
-      return;
-    }
-    const { challengeId, otp } = req.body ?? {};
-    if (typeof challengeId !== 'string' || !UUID_REGEX.test(challengeId) || typeof otp !== 'string') {
-      res.status(400).json({ error: 'कृपया सही 6-अंक का OTP दर्ज करें।' });
-      return;
-    }
-    if (!/^\d{6}$/.test(otp.trim())) {
-      res.status(400).json({ error: 'OTP ठीक 6 अंकों का होना चाहिए।' });
-      return;
-    }
-    try {
-      const user = verifyLoginOtpChallenge(challengeId, otp);
-      const token = createSession(user.id);
-      res.json({ token, user });
-    } catch (err) {
-      const code = err instanceof Error ? err.message : '';
-      if (code === 'OTP_EXPIRED') {
-        res.status(400).json({ error: 'OTP की समय-सीमा (5 मिनट) समाप्त हो गई है। कृपया नया OTP मंगाएँ।' });
-        return;
-      }
-      if (code === 'OTP_MAX_ATTEMPTS') {
-        res.status(429).json({ error: 'गलत OTP के अधिक प्रयास हुए। कृपया दोबारा लॉगिन करके नया OTP मंगाएँ।' });
-        return;
-      }
-      if (code === 'OTP_INVALID') {
-        res.status(401).json({ error: 'दर्ज किया गया OTP गलत है। कृपया दोबारा जाँचें।' });
-        return;
-      }
-      res.status(400).json({ error: 'OTP सेशन अमान्य है। कृपया पुनः प्रयास करें।' });
-    }
+    const token = createSession(user.id);
+    res.json({ token, user });
   });
 
   app.post('/api/auth/logout', requireAuth, (req: AuthedRequest, res: Response) => {

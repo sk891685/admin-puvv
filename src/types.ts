@@ -15,31 +15,12 @@ export interface User {
 export interface AuthStatus {
   needsAdminSetup: boolean;
   envAdminConfigured: boolean;
-  smtpConfigured: boolean;
 }
 
-export interface OtpChallenge {
-  challengeId: string;
-  maskedEmail: string;
-  expiresInSeconds: number;
+export interface LoginResponse {
+  token: string;
+  user: User;
 }
-
-export type LoginResponse =
-  | {
-      step: 'otp_verify';
-      challengeId: string;
-      maskedEmail: string;
-      expiresInSeconds: number;
-    }
-  | {
-      step: 'gmail_required';
-      preAuthId: string;
-      expiresInSeconds: number;
-    }
-  | {
-      step: 'smtp_setup_required';
-      maskedEmail: string;
-    };
 
 export interface DatasetInfo {
   id: number;

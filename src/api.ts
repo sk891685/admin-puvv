@@ -3,7 +3,6 @@ import type {
   DatasetInfo,
   DatasetPayload,
   LoginResponse,
-  OtpChallenge,
   RemarkFilterMode,
   RemarkItem,
   UploadProgress,
@@ -76,33 +75,6 @@ export async function loginWithPassword(
   return apiFetch<LoginResponse>('/api/auth/login', {
     method: 'POST',
     body: JSON.stringify({ username, password }),
-  });
-}
-
-export async function sendStep2GmailOtp(
-  preAuthId: string,
-  email: string
-): Promise<OtpChallenge> {
-  return apiFetch<OtpChallenge>('/api/auth/step2-send-otp', {
-    method: 'POST',
-    body: JSON.stringify({ preAuthId, email }),
-  });
-}
-
-export async function resendEmailOtp(challengeId: string): Promise<OtpChallenge> {
-  return apiFetch<OtpChallenge>('/api/auth/resend-otp', {
-    method: 'POST',
-    body: JSON.stringify({ challengeId }),
-  });
-}
-
-export async function verifyEmailOtp(
-  challengeId: string,
-  otp: string
-): Promise<{ token: string; user: User }> {
-  return apiFetch<{ token: string; user: User }>('/api/auth/verify-otp', {
-    method: 'POST',
-    body: JSON.stringify({ challengeId, otp }),
   });
 }
 
@@ -287,6 +259,29 @@ async function downloadBinaryFile(url: string, fallbackName: string): Promise<vo
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(objectUrl);
+}
+
+export async function fetchExportExcelBlob(): Promise<{ blob: Blob; fileName: string }> {
+  const headers = new Headers();
+  if (memoryToken) {
+    headers.set('Authorization', `Bearer ${memoryToken}`);
+  }
+  const response = await fetch('/api/dataset/export', { headers });
+  if (!response.ok) {
+    let message = 'Excel बैकअप तैयार करने में त्रुटि हुई।';
+    try {
+      const errBody = (await response.json()) as { error?: string };
+      if (errBody.error) message = errBody.error;
+    } catch {
+      // ignore
+    }
+    throw new Error(message);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get('Content-Disposition') ?? '';
+  const match = disposition.match(/filename="?([^"]+)"?/i);
+  const fileName = match?.[1] || 'data_with_remarks.xlsx';
+  return { blob, fileName };
 }
 
 export async function downloadExcelWithRemarks(): Promise<void> {

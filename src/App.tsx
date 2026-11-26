@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FileUp, LogOut, Search, Users } from 'lucide-react';
+import { FileUp, HardDrive, LogOut, Search, Users } from 'lucide-react';
 import { fetchAuthStatus, fetchDataset, logoutSession, setAuthToken } from './api';
 import { DataSearchView } from './components/DataSearchView';
+import { GoogleDrivePanel } from './components/GoogleDrivePanel';
 import { LoginView } from './components/LoginView';
 import { PuvvnlLogo } from './components/PuvvnlLogo';
 import { RemarkSheet } from './components/RemarkSheet';
 import { UploadPanel } from './components/UploadPanel';
 import { UserManagement } from './components/UserManagement';
+import { disconnectGoogleDrive } from './lib/googleDriveAuth';
 import type { AuthStatus, DatasetInfo, DatasetQuery, DatasetRow, RemarkItem, User } from './types';
 import { ROLE_META } from './types';
 
-type ActiveTab = 'search' | 'upload' | 'users';
+type ActiveTab = 'search' | 'upload' | 'drive' | 'users';
 
 const DEFAULT_QUERY: DatasetQuery = {
   q: '',
@@ -107,12 +109,17 @@ export default function App() {
     setAuthStatus((prev) =>
       prev
         ? { ...prev, needsAdminSetup: false }
-        : { needsAdminSetup: false, envAdminConfigured: false, smtpConfigured: false }
+        : { needsAdminSetup: false, envAdminConfigured: false }
     );
   }
 
   async function handleLogout() {
     await logoutSession();
+    try {
+      await disconnectGoogleDrive();
+    } catch {
+      // ignore if Google Drive was not connected
+    }
     setCurrentUser(null);
     setDataset(null);
     setRows([]);
@@ -204,9 +211,13 @@ export default function App() {
     ? [
         { id: 'search', label: 'डाटा खोजें', icon: Search },
         { id: 'upload', label: 'Excel प्रबंधन', icon: FileUp },
+        { id: 'drive', label: 'Google Drive', icon: HardDrive },
         { id: 'users', label: 'यूज़र प्रबंधन', icon: Users },
       ]
-    : [{ id: 'search', label: 'डाटा खोजें', icon: Search }];
+    : [
+        { id: 'search', label: 'डाटा खोजें', icon: Search },
+        { id: 'drive', label: 'Google Drive', icon: HardDrive },
+      ];
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -264,11 +275,7 @@ export default function App() {
       </header>
 
       {/* Main Content Container */}
-      <main
-        className={`flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-7 ${
-          isAdmin ? 'pb-24 md:pb-10' : 'pb-10'
-        }`}
-      >
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-7 pb-24 md:pb-10">
         {/* Clean Unboxed User Identity Line */}
         <div className="mb-5 pb-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-slate-600">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
@@ -330,6 +337,18 @@ export default function App() {
             onDatasetChanged={handleDatasetReplaced}
             onNotify={showToast}
             onOpenSearch={() => setActiveTab('search')}
+            onOpenDrive={() => setActiveTab('drive')}
+          />
+        )}
+
+        {activeTab === 'drive' && (
+          <GoogleDrivePanel
+            currentUser={currentUser}
+            dataset={dataset}
+            totalRemarks={totalVisibleRemarks}
+            onDatasetChanged={handleDatasetReplaced}
+            onNotify={showToast}
+            onOpenSearch={() => setActiveTab('search')}
           />
         )}
 
@@ -338,33 +357,31 @@ export default function App() {
         )}
       </main>
 
-      {/* Mobile Fixed Bottom Tab Bar for Admin */}
-      {isAdmin && (
-        <nav
-          aria-label="मोबाइल नेविगेशन"
-          className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
-        >
-          <div className="grid grid-cols-3 h-14">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const isActive = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setActiveTab(item.id)}
-                  className={`flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
-                    isActive ? 'text-blue-700 font-semibold' : 'text-slate-500'
-                  }`}
-                >
-                  <Icon className="h-5 w-5" />
-                  <span className="text-[11px] leading-tight whitespace-nowrap">{item.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        </nav>
-      )}
+      {/* Mobile Fixed Bottom Tab Bar */}
+      <nav
+        aria-label="मोबाइल नेविगेशन"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 pb-safe"
+      >
+        <div className={`grid h-14 ${isAdmin ? 'grid-cols-4' : 'grid-cols-2'}`}>
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const isActive = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveTab(item.id)}
+                className={`flex flex-col items-center justify-center gap-0.5 transition-colors cursor-pointer ${
+                  isActive ? 'text-blue-700 font-semibold' : 'text-slate-500'
+                }`}
+              >
+                <Icon className="h-5 w-5" />
+                <span className="text-[11px] leading-tight whitespace-nowrap">{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
 
       {/* Remark Bottom Sheet / Desktop Slide-Over */}
       <RemarkSheet
