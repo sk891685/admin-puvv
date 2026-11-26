@@ -22,6 +22,13 @@ export interface LoginResponse {
   user: User;
 }
 
+export interface RestoreSummary {
+  userCount: number;
+  rowCount: number;
+  remarkCount: number;
+  datasetFileName: string | null;
+}
+
 export interface DatasetInfo {
   id: number;
   fileName: string;

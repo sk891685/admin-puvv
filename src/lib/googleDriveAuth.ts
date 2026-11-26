@@ -266,3 +266,135 @@ export async function trashDriveFile(accessToken: string, fileId: string): Promi
     throw new Error('Google Drive फ़ाइल हटाने में त्रुटि हुई।');
   }
 }
+
+// --- Canonical Portal Cloud Storage File in Google Drive ---
+
+export const PORTAL_BACKUP_FILENAME = 'PuVVNL_Portal_Data.json';
+const DRIVE_BACKUP_HINT_KEY = 'puvvnl_drive_backup_linked';
+
+export function hasKnownDriveBackupHint(): boolean {
+  try {
+    return window.localStorage.getItem(DRIVE_BACKUP_HINT_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setKnownDriveBackupHint(linked: boolean): void {
+  try {
+    if (linked) {
+      window.localStorage.setItem(DRIVE_BACKUP_HINT_KEY, '1');
+    } else {
+      window.localStorage.removeItem(DRIVE_BACKUP_HINT_KEY);
+    }
+  } catch {
+    // ignore storage restrictions
+  }
+}
+
+export async function findPortalBackupFile(accessToken: string): Promise<DriveFileItem | null> {
+  const search = new URLSearchParams({
+    q: `name = '${PORTAL_BACKUP_FILENAME}' and trashed = false`,
+    pageSize: '5',
+    orderBy: 'modifiedTime desc',
+    fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
+  });
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files?${search.toString()}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+  if (res.status === 401) {
+    cachedAccessToken = null;
+    throw new Error('DRIVE_AUTH_EXPIRED');
+  }
+  if (!res.ok) {
+    throw new Error('Google Drive में पोर्टल बैकअप खोजने में त्रुटि हुई।');
+  }
+  const data = (await res.json()) as { files?: DriveFileItem[] };
+  return data.files?.[0] ?? null;
+}
+
+export async function savePortalBackupToDrive(
+  accessToken: string,
+  snapshot: unknown
+): Promise<DriveFileItem> {
+  const existing = await findPortalBackupFile(accessToken);
+  const jsonText = JSON.stringify(snapshot);
+  const jsonBlob = new Blob([jsonText], { type: 'application/json' });
+
+  let saved: DriveFileItem;
+  if (existing) {
+    const res = await fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(existing.id)}?uploadType=media&fields=id,name,mimeType,size,modifiedTime,webViewLink`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: jsonBlob,
+      }
+    );
+    if (res.status === 401) {
+      cachedAccessToken = null;
+      throw new Error('DRIVE_AUTH_EXPIRED');
+    }
+    if (!res.ok) {
+      throw new Error('Google Drive में पोर्टल डाटा अपडेट करने में त्रुटि हुई।');
+    }
+    saved = (await res.json()) as DriveFileItem;
+  } else {
+    saved = await uploadBlobToGoogleDrive({
+      accessToken,
+      blob: jsonBlob,
+      fileName: PORTAL_BACKUP_FILENAME,
+      mimeType: 'application/json',
+    });
+  }
+
+  setKnownDriveBackupHint(true);
+  return saved;
+}
+
+export async function loadPortalBackupFromDrive(
+  accessToken: string
+): Promise<{ file: DriveFileItem; snapshot: unknown } | null> {
+  const existing = await findPortalBackupFile(accessToken);
+  if (!existing) {
+    setKnownDriveBackupHint(false);
+    return null;
+  }
+
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(existing.id)}?alt=media`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    }
+  );
+  if (res.status === 401) {
+    cachedAccessToken = null;
+    throw new Error('DRIVE_AUTH_EXPIRED');
+  }
+  if (!res.ok) {
+    throw new Error('Google Drive से पोर्टल डाटा डाउनलोड करने में त्रुटि हुई।');
+  }
+
+  const snapshot = (await res.json()) as unknown;
+  setKnownDriveBackupHint(true);
+  return { file: existing, snapshot };
+}
+
+export async function deletePortalBackupFromDrive(accessToken: string): Promise<boolean> {
+  const existing = await findPortalBackupFile(accessToken);
+  if (!existing) {
+    setKnownDriveBackupHint(false);
+    return false;
+  }
+  await trashDriveFile(accessToken, existing.id);
+  setKnownDriveBackupHint(false);
+  return true;
+}
+

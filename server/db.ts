@@ -1147,3 +1147,444 @@ export function deleteRemark(remarkId: number, user: SafeUser): void {
   }
   db.prepare('DELETE FROM remarks WHERE id = ?').run(remarkId);
 }
+
+// --- Full Portal Backup / Restore (for Google Drive Cloud Storage Sync) ---
+
+export interface PortalSnapshotUser {
+  id: number;
+  username: string;
+  email: string;
+  mobile: string;
+  fullName: string;
+  passwordHash: string;
+  role: UserRole;
+  supervisorId: number | null;
+  createdAt: string;
+}
+
+export interface PortalSnapshotDataset {
+  id: number;
+  fileName: string;
+  headers: string[];
+  rowCount: number;
+  uploadedById: number | null;
+  uploadedByName: string;
+  uploadedAt: string;
+}
+
+export interface PortalSnapshotRow {
+  id: number;
+  rowIndex: number;
+  dataJson: string;
+  searchText: string;
+}
+
+export interface PortalSnapshotRemark {
+  id: number;
+  rowId: number;
+  userId: number | null;
+  userName: string;
+  userRole: UserRole;
+  comment: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PortalSnapshot {
+  version: 1;
+  app: 'puvvnl-portal';
+  exportedAt: string;
+  users: PortalSnapshotUser[];
+  activeDataset: PortalSnapshotDataset | null;
+  rows: PortalSnapshotRow[];
+  remarks: PortalSnapshotRemark[];
+}
+
+export interface RestoreSummary {
+  userCount: number;
+  rowCount: number;
+  remarkCount: number;
+  datasetFileName: string | null;
+}
+
+const SCRYPT_HASH_REGEX = /^[0-9a-f]{32}:[0-9a-f]{128}$/i;
+
+export function exportPortalSnapshot(): PortalSnapshot {
+  const rawUsers = db
+    .prepare(
+      `SELECT id, username, email, mobile, full_name, password_hash, role, supervisor_id, created_at
+       FROM users
+       ORDER BY id ASC`
+    )
+    .all() as DbUser[];
+
+  const users: PortalSnapshotUser[] = rawUsers.map((u) => ({
+    id: u.id,
+    username: u.username,
+    email: u.email ?? '',
+    mobile: u.mobile ?? '',
+    fullName: u.full_name,
+    passwordHash: u.password_hash,
+    role: u.role,
+    supervisorId: u.supervisor_id,
+    createdAt: u.created_at,
+  }));
+
+  const rawDataset = db
+    .prepare(
+      `SELECT id, file_name, headers_json, row_count, uploaded_by_id, uploaded_by_name, uploaded_at
+       FROM datasets
+       WHERE is_active = 1
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .get() as
+    | {
+        id: number;
+        file_name: string;
+        headers_json: string;
+        row_count: number;
+        uploaded_by_id: number | null;
+        uploaded_by_name: string;
+        uploaded_at: string;
+      }
+    | undefined;
+
+  let activeDataset: PortalSnapshotDataset | null = null;
+  let rows: PortalSnapshotRow[] = [];
+  let remarks: PortalSnapshotRemark[] = [];
+
+  if (rawDataset) {
+    activeDataset = {
+      id: rawDataset.id,
+      fileName: rawDataset.file_name,
+      headers: JSON.parse(rawDataset.headers_json) as string[],
+      rowCount: rawDataset.row_count,
+      uploadedById: rawDataset.uploaded_by_id,
+      uploadedByName: rawDataset.uploaded_by_name,
+      uploadedAt: rawDataset.uploaded_at,
+    };
+
+    const rawRows = db
+      .prepare(
+        `SELECT id, row_index, data_json, search_text
+         FROM dataset_rows
+         WHERE dataset_id = ?
+         ORDER BY row_index ASC`
+      )
+      .all(rawDataset.id) as Array<{
+      id: number;
+      row_index: number;
+      data_json: string;
+      search_text: string;
+    }>;
+
+    rows = rawRows.map((r) => ({
+      id: r.id,
+      rowIndex: r.row_index,
+      dataJson: r.data_json,
+      searchText: r.search_text,
+    }));
+
+    const rawRemarks = db
+      .prepare(
+        `SELECT id, row_id, user_id, user_name, user_role, comment, created_at, updated_at
+         FROM remarks
+         WHERE dataset_id = ?
+         ORDER BY id ASC`
+      )
+      .all(rawDataset.id) as Array<{
+      id: number;
+      row_id: number;
+      user_id: number | null;
+      user_name: string;
+      user_role: UserRole;
+      comment: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    remarks = rawRemarks.map((rm) => ({
+      id: rm.id,
+      rowId: rm.row_id,
+      userId: rm.user_id,
+      userName: rm.user_name,
+      userRole: rm.user_role,
+      comment: rm.comment,
+      createdAt: rm.created_at,
+      updatedAt: rm.updated_at,
+    }));
+  }
+
+  return {
+    version: 1,
+    app: 'puvvnl-portal',
+    exportedAt: new Date().toISOString(),
+    users,
+    activeDataset,
+    rows,
+    remarks,
+  };
+}
+
+const restoreSnapshotTxn = db.transaction((snapshot: PortalSnapshot): RestoreSummary => {
+  // Wipe current tables in FK-safe order
+  db.prepare('DELETE FROM remarks').run();
+  db.prepare('DELETE FROM dataset_rows').run();
+  db.prepare('DELETE FROM datasets').run();
+  db.prepare('DELETE FROM sessions').run();
+  db.prepare('DELETE FROM users').run();
+
+  const insertUserStmt = db.prepare(
+    `INSERT INTO users (id, username, email, mobile, full_name, password_hash, role, supervisor_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+  );
+
+  const validUserIds = new Set<number>();
+  for (const u of snapshot.users) {
+    insertUserStmt.run(
+      u.id,
+      u.username.trim().toLowerCase(),
+      u.email.trim().toLowerCase(),
+      u.mobile.trim(),
+      u.fullName.trim(),
+      u.passwordHash,
+      u.role,
+      u.createdAt || new Date().toISOString()
+    );
+    validUserIds.add(u.id);
+  }
+
+  const updateSupStmt = db.prepare('UPDATE users SET supervisor_id = ? WHERE id = ?');
+  for (const u of snapshot.users) {
+    if (u.role === 'lineman' && u.supervisorId !== null && validUserIds.has(u.supervisorId)) {
+      updateSupStmt.run(u.supervisorId, u.id);
+    }
+  }
+
+  let restoredRows = 0;
+  let restoredRemarks = 0;
+  let datasetFileName: string | null = null;
+
+  if (snapshot.activeDataset) {
+    const ds = snapshot.activeDataset;
+    const uploadedById =
+      ds.uploadedById !== null && validUserIds.has(ds.uploadedById) ? ds.uploadedById : null;
+
+    db.prepare(
+      `INSERT INTO datasets (id, file_name, headers_json, row_count, uploaded_by_id, uploaded_by_name, uploaded_at, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+    ).run(
+      ds.id,
+      ds.fileName,
+      JSON.stringify(ds.headers),
+      snapshot.rows.length,
+      uploadedById,
+      ds.uploadedByName || 'Admin',
+      ds.uploadedAt || new Date().toISOString()
+    );
+    datasetFileName = ds.fileName;
+
+    const validRowIds = new Set<number>();
+    const insertRowStmt = db.prepare(
+      `INSERT INTO dataset_rows (id, dataset_id, row_index, data_json, search_text)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    for (const r of snapshot.rows) {
+      insertRowStmt.run(r.id, ds.id, r.rowIndex, r.dataJson, r.searchText);
+      validRowIds.add(r.id);
+      restoredRows += 1;
+    }
+
+    const insertRemarkStmt = db.prepare(
+      `INSERT INTO remarks (id, dataset_id, row_id, user_id, user_name, user_role, comment, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const rm of snapshot.remarks) {
+      if (!validRowIds.has(rm.rowId)) continue;
+      const safeUserId = rm.userId !== null && validUserIds.has(rm.userId) ? rm.userId : null;
+      insertRemarkStmt.run(
+        rm.id,
+        ds.id,
+        rm.rowId,
+        safeUserId,
+        rm.userName,
+        rm.userRole,
+        rm.comment,
+        rm.createdAt || new Date().toISOString(),
+        rm.updatedAt || rm.createdAt || new Date().toISOString()
+      );
+      restoredRemarks += 1;
+    }
+  }
+
+  return {
+    userCount: snapshot.users.length,
+    rowCount: restoredRows,
+    remarkCount: restoredRemarks,
+    datasetFileName,
+  };
+});
+
+export function restorePortalSnapshot(raw: unknown): RestoreSummary {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('INVALID_SNAPSHOT');
+  }
+  const obj = raw as Record<string, unknown>;
+  if (obj.version !== 1 || obj.app !== 'puvvnl-portal') {
+    throw new Error('INVALID_SNAPSHOT_FORMAT');
+  }
+  if (!Array.isArray(obj.users) || obj.users.length === 0) {
+    throw new Error('SNAPSHOT_NO_USERS');
+  }
+
+  const parsedUsers: PortalSnapshotUser[] = [];
+  let hasAdmin = false;
+  const seenIds = new Set<number>();
+  const seenUsernames = new Set<string>();
+
+  for (const item of obj.users) {
+    if (!item || typeof item !== 'object') throw new Error('INVALID_USER_ENTRY');
+    const u = item as Record<string, unknown>;
+    if (
+      typeof u.id !== 'number' ||
+      !Number.isInteger(u.id) ||
+      u.id <= 0 ||
+      typeof u.username !== 'string' ||
+      u.username.trim().length < 2 ||
+      typeof u.fullName !== 'string' ||
+      u.fullName.trim().length < 1 ||
+      typeof u.passwordHash !== 'string' ||
+      !SCRYPT_HASH_REGEX.test(u.passwordHash) ||
+      !isValidRole(u.role)
+    ) {
+      throw new Error('INVALID_USER_ENTRY');
+    }
+    const lowerUser = u.username.trim().toLowerCase();
+    if (seenIds.has(u.id) || seenUsernames.has(lowerUser)) {
+      throw new Error('DUPLICATE_USER_ENTRY');
+    }
+    seenIds.add(u.id);
+    seenUsernames.add(lowerUser);
+    if (u.role === 'admin') hasAdmin = true;
+
+    parsedUsers.push({
+      id: u.id,
+      username: lowerUser,
+      email: typeof u.email === 'string' ? u.email.trim().toLowerCase() : '',
+      mobile: typeof u.mobile === 'string' ? u.mobile.trim() : '',
+      fullName: u.fullName.trim(),
+      passwordHash: u.passwordHash,
+      role: u.role,
+      supervisorId:
+        typeof u.supervisorId === 'number' && Number.isInteger(u.supervisorId) && u.supervisorId > 0
+          ? u.supervisorId
+          : null,
+      createdAt: typeof u.createdAt === 'string' ? u.createdAt : new Date().toISOString(),
+    });
+  }
+
+  if (!hasAdmin) {
+    throw new Error('SNAPSHOT_NO_ADMIN');
+  }
+
+  let parsedDataset: PortalSnapshotDataset | null = null;
+  const parsedRows: PortalSnapshotRow[] = [];
+  const parsedRemarks: PortalSnapshotRemark[] = [];
+
+  if (obj.activeDataset !== null && obj.activeDataset !== undefined) {
+    if (typeof obj.activeDataset !== 'object') throw new Error('INVALID_DATASET_ENTRY');
+    const ds = obj.activeDataset as Record<string, unknown>;
+    if (
+      typeof ds.id !== 'number' ||
+      !Number.isInteger(ds.id) ||
+      ds.id <= 0 ||
+      typeof ds.fileName !== 'string' ||
+      !ds.fileName.trim() ||
+      !Array.isArray(ds.headers) ||
+      !ds.headers.every((h) => typeof h === 'string')
+    ) {
+      throw new Error('INVALID_DATASET_ENTRY');
+    }
+    parsedDataset = {
+      id: ds.id,
+      fileName: ds.fileName.trim(),
+      headers: ds.headers as string[],
+      rowCount: typeof ds.rowCount === 'number' ? ds.rowCount : 0,
+      uploadedById:
+        typeof ds.uploadedById === 'number' && Number.isInteger(ds.uploadedById)
+          ? ds.uploadedById
+          : null,
+      uploadedByName: typeof ds.uploadedByName === 'string' ? ds.uploadedByName : 'Admin',
+      uploadedAt: typeof ds.uploadedAt === 'string' ? ds.uploadedAt : new Date().toISOString(),
+    };
+
+    if (Array.isArray(obj.rows)) {
+      for (const item of obj.rows) {
+        if (!item || typeof item !== 'object') throw new Error('INVALID_ROW_ENTRY');
+        const r = item as Record<string, unknown>;
+        if (
+          typeof r.id !== 'number' ||
+          !Number.isInteger(r.id) ||
+          r.id <= 0 ||
+          typeof r.rowIndex !== 'number' ||
+          !Number.isInteger(r.rowIndex) ||
+          typeof r.dataJson !== 'string' ||
+          typeof r.searchText !== 'string'
+        ) {
+          throw new Error('INVALID_ROW_ENTRY');
+        }
+        parsedRows.push({
+          id: r.id,
+          rowIndex: r.rowIndex,
+          dataJson: r.dataJson,
+          searchText: r.searchText,
+        });
+      }
+    }
+
+    if (Array.isArray(obj.remarks)) {
+      for (const item of obj.remarks) {
+        if (!item || typeof item !== 'object') throw new Error('INVALID_REMARK_ENTRY');
+        const rm = item as Record<string, unknown>;
+        if (
+          typeof rm.id !== 'number' ||
+          !Number.isInteger(rm.id) ||
+          rm.id <= 0 ||
+          typeof rm.rowId !== 'number' ||
+          !Number.isInteger(rm.rowId) ||
+          rm.rowId <= 0 ||
+          typeof rm.userName !== 'string' ||
+          !isValidRole(rm.userRole) ||
+          typeof rm.comment !== 'string'
+        ) {
+          throw new Error('INVALID_REMARK_ENTRY');
+        }
+        parsedRemarks.push({
+          id: rm.id,
+          rowId: rm.rowId,
+          userId:
+            typeof rm.userId === 'number' && Number.isInteger(rm.userId) && rm.userId > 0
+              ? rm.userId
+              : null,
+          userName: rm.userName,
+          userRole: rm.userRole,
+          comment: rm.comment,
+          createdAt: typeof rm.createdAt === 'string' ? rm.createdAt : new Date().toISOString(),
+          updatedAt: typeof rm.updatedAt === 'string' ? rm.updatedAt : new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  return restoreSnapshotTxn({
+    version: 1,
+    app: 'puvvnl-portal',
+    exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
+    users: parsedUsers,
+    activeDataset: parsedDataset,
+    rows: parsedRows,
+    remarks: parsedRemarks,
+  });
+}
+

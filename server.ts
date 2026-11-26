@@ -15,6 +15,7 @@ import {
   deleteRemark,
   deleteUserAccount,
   deriveUniqueUsername,
+  exportPortalSnapshot,
   getActiveDataset,
   getAllRemarksByRowAdmin,
   getDistinctColumnValues,
@@ -27,6 +28,7 @@ import {
   needsAdminSetup,
   normalizeMobile,
   queryDatasetRows,
+  restorePortalSnapshot,
   revokeSession,
   saveNewDataset,
   updateOwnRemark,
@@ -267,6 +269,64 @@ async function startServer(): Promise<void> {
   app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
     res.json({ user: req.currentUser });
   });
+
+  // --- Portal Backup / Restore Routes (Synced to Google Drive Storage) ---
+
+  app.get('/api/sync/export', requireAuth, requireAdmin, (_req: AuthedRequest, res: Response) => {
+    try {
+      const snapshot = exportPortalSnapshot();
+      res.json({ snapshot });
+    } catch {
+      res.status(500).json({ error: 'पोर्टल बैकअप तैयार करने में त्रुटि हुई।' });
+    }
+  });
+
+  app.post(
+    '/api/sync/restore',
+    express.json({ limit: '50mb' }),
+    (req: Request, res: Response) => {
+      const clientIp = req.ip || 'unknown';
+      if (!checkLoginRateLimit(clientIp)) {
+        res.status(429).json({ error: 'बहुत अधिक प्रयास किए गए। कृपया 1 मिनट बाद पुनः प्रयास करें।' });
+        return;
+      }
+
+      // Authorize: either authenticated Admin, OR empty database (first-run restore from Google Drive)
+      const token = extractBearerToken(req);
+      const authedUser = token ? getUserBySessionToken(token) : null;
+      const isAuthedAdmin = authedUser?.role === 'admin';
+      const isEmptyDb = needsAdminSetup();
+
+      if (!isAuthedAdmin && !isEmptyDb) {
+        res.status(403).json({
+          error: 'डाटा रिस्टोर करने के लिए Admin लॉगिन आवश्यक है।',
+        });
+        return;
+      }
+
+      try {
+        const snapshotPayload = req.body?.snapshot ?? req.body;
+        const summary = restorePortalSnapshot(snapshotPayload);
+        res.json({ ok: true, summary });
+      } catch (err) {
+        const code = err instanceof Error ? err.message : '';
+        if (
+          code === 'INVALID_SNAPSHOT' ||
+          code === 'INVALID_SNAPSHOT_FORMAT' ||
+          code === 'SNAPSHOT_NO_USERS' ||
+          code === 'SNAPSHOT_NO_ADMIN' ||
+          code.startsWith('INVALID_') ||
+          code === 'DUPLICATE_USER_ENTRY'
+        ) {
+          res.status(400).json({
+            error: 'Google Drive बैकअप फ़ाइल मान्य पोर्टल बैकअप नहीं है।',
+          });
+          return;
+        }
+        res.status(500).json({ error: 'Google Drive से डाटा रिस्टोर करने में त्रुटि हुई।' });
+      }
+    }
+  );
 
   // --- Admin User Management Routes ---
 

@@ -5,6 +5,7 @@ import type {
   LoginResponse,
   RemarkFilterMode,
   RemarkItem,
+  RestoreSummary,
   UploadProgress,
   User,
   UserRole,
@@ -351,5 +352,18 @@ export async function updateUser(
 export async function deleteUser(userId: number): Promise<void> {
   await apiFetch<{ ok: boolean }>(`/api/users/${userId}`, {
     method: 'DELETE',
+  });
+}
+
+export async function exportPortalSnapshotApi(): Promise<{ snapshot: unknown }> {
+  return apiFetch<{ snapshot: unknown }>('/api/sync/export');
+}
+
+export async function restorePortalSnapshotApi(
+  snapshot: unknown
+): Promise<{ ok: boolean; summary: RestoreSummary }> {
+  return apiFetch<{ ok: boolean; summary: RestoreSummary }>('/api/sync/restore', {
+    method: 'POST',
+    body: JSON.stringify({ snapshot }),
   });
 }

@@ -1,16 +1,37 @@
-import { useCallback, useEffect, useState } from 'react';
-import { FileUp, HardDrive, LogOut, Search, Users } from 'lucide-react';
-import { fetchAuthStatus, fetchDataset, logoutSession, setAuthToken } from './api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { CloudUpload, FileUp, HardDrive, LogOut, RefreshCw, Search, Users } from 'lucide-react';
+import {
+  exportPortalSnapshotApi,
+  fetchAuthStatus,
+  fetchDataset,
+  logoutSession,
+  setAuthToken,
+} from './api';
 import { DataSearchView } from './components/DataSearchView';
 import { GoogleDrivePanel } from './components/GoogleDrivePanel';
+import { GoogleSignInButton } from './components/GoogleSignInButton';
 import { LoginView } from './components/LoginView';
 import { PuvvnlLogo } from './components/PuvvnlLogo';
 import { RemarkSheet } from './components/RemarkSheet';
 import { UploadPanel } from './components/UploadPanel';
 import { UserManagement } from './components/UserManagement';
-import { disconnectGoogleDrive } from './lib/googleDriveAuth';
-import type { AuthStatus, DatasetInfo, DatasetQuery, DatasetRow, RemarkItem, User } from './types';
-import { ROLE_META } from './types';
+import {
+  disconnectGoogleDrive,
+  getDriveAccessToken,
+  PORTAL_BACKUP_FILENAME,
+  savePortalBackupToDrive,
+  signInWithGoogleDrive,
+} from './lib/googleDriveAuth';
+import type {
+  AuthStatus,
+  DatasetInfo,
+  DatasetQuery,
+  DatasetRow,
+  RemarkItem,
+  RestoreSummary,
+  User,
+} from './types';
+import { formatHindiDateTime, ROLE_META } from './types';
 
 type ActiveTab = 'search' | 'upload' | 'drive' | 'users';
 
@@ -41,13 +62,22 @@ export default function App() {
   const [selectedRow, setSelectedRow] = useState<DatasetRow | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  // Google Drive Cloud Storage Auto-Sync state (for Admin)
+  const [driveSyncEnabled, setDriveSyncEnabled] = useState(false);
+  const [syncingDrive, setSyncingDrive] = useState(false);
+  const [connectingSync, setConnectingSync] = useState(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [showEnableSyncModal, setShowEnableSyncModal] = useState(false);
+  const [syncBannerDismissed, setSyncBannerDismissed] = useState(false);
+  const syncInFlightRef = useRef(false);
+
   const showToast = useCallback((message: string) => {
     setToast(message);
   }, []);
 
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 4000);
+    const timer = window.setTimeout(() => setToast(null), 4500);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
@@ -64,6 +94,84 @@ export default function App() {
   useEffect(() => {
     void loadAuthStatus();
   }, [loadAuthStatus]);
+
+  const syncPortalToDrive = useCallback(
+    async (options: { notify?: boolean; enableAfter?: boolean } = {}) => {
+      if (syncInFlightRef.current) return;
+      const token = getDriveAccessToken();
+      if (!token) {
+        if (options.notify) {
+          showToast('Google Drive सेशन समाप्त हो गया है—कृपया दोबारा Google Drive कनेक्ट करें।');
+        }
+        setDriveSyncEnabled(false);
+        return;
+      }
+
+      syncInFlightRef.current = true;
+      setSyncingDrive(true);
+      try {
+        const { snapshot } = await exportPortalSnapshotApi();
+        const saved = await savePortalBackupToDrive(token, snapshot);
+        setLastSyncedAt(saved.modifiedTime ?? new Date().toISOString());
+        if (options.enableAfter) {
+          setDriveSyncEnabled(true);
+        }
+        if (options.notify) {
+          showToast(`पूरा पोर्टल डाटा Google Drive (${PORTAL_BACKUP_FILENAME}) में सुरक्षित सेव हो गया।`);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message === 'DRIVE_AUTH_EXPIRED') {
+          setDriveSyncEnabled(false);
+          showToast('Google Drive सेशन समाप्त हो गया है। ऑटो-सिंक के लिए पुनः कनेक्ट करें।');
+        } else if (options.notify) {
+          showToast(
+            err instanceof Error ? err.message : 'Google Drive में डाटा सिंक करने में त्रुटि हुई।'
+          );
+        }
+      } finally {
+        syncInFlightRef.current = false;
+        setSyncingDrive(false);
+      }
+    },
+    [showToast]
+  );
+
+  const triggerAutoSyncIfEnabled = useCallback(() => {
+    if (currentUser?.role === 'admin' && driveSyncEnabled && getDriveAccessToken()) {
+      void syncPortalToDrive({ notify: false });
+    }
+  }, [currentUser?.role, driveSyncEnabled, syncPortalToDrive]);
+
+  async function handleStartEnableDriveSync() {
+    if (getDriveAccessToken()) {
+      setShowEnableSyncModal(true);
+      return;
+    }
+    setConnectingSync(true);
+    try {
+      await signInWithGoogleDrive();
+      setShowEnableSyncModal(true);
+    } catch (err) {
+      const code =
+        typeof err === 'object' && err && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (code === 'auth/popup-closed-by-user') {
+        showToast('Google साइन-इन रद्द कर दिया गया।');
+      } else if (code === 'auth/popup-blocked') {
+        showToast('कृपया ब्राउज़र में पॉपअप अनुमति दें और पुनः प्रयास करें।');
+      } else {
+        showToast(err instanceof Error ? err.message : 'Google Drive कनेक्ट करने में त्रुटि हुई।');
+      }
+    } finally {
+      setConnectingSync(false);
+    }
+  }
+
+  async function handleConfirmEnableDriveSync() {
+    setShowEnableSyncModal(false);
+    await syncPortalToDrive({ notify: true, enableAfter: true });
+  }
 
   const loadDataset = useCallback(
     async (overrideQuery?: DatasetQuery) => {
@@ -99,18 +207,54 @@ export default function App() {
   const handleDatasetReplaced = useCallback(async () => {
     setDatasetQuery(DEFAULT_QUERY);
     await loadDataset(DEFAULT_QUERY);
-  }, [loadDataset]);
+    triggerAutoSyncIfEnabled();
+  }, [loadDataset, triggerAutoSyncIfEnabled]);
 
-  function handleAuthenticated(token: string, user: User) {
+  const handleRestoredFromDriveOnLogin = useCallback(
+    async (_summary: RestoreSummary) => {
+      await loadAuthStatus();
+    },
+    [loadAuthStatus]
+  );
+
+  const handlePortalRestoredInSession = useCallback(
+    async (summary: RestoreSummary) => {
+      await logoutSession();
+      setCurrentUser(null);
+      setDataset(null);
+      setRows([]);
+      setRemarksByRow({});
+      setTotalFiltered(0);
+      setRowsWithRemarksCount(0);
+      setTotalVisibleRemarks(0);
+      setDatasetQuery(DEFAULT_QUERY);
+      setSelectedRow(null);
+      setActiveTab('search');
+      setDriveSyncEnabled(false);
+      await loadAuthStatus();
+      showToast(
+        `Google Drive से डाटा रिस्टोर हुआ (${summary.userCount} यूज़र, ${summary.rowCount} रिकॉर्ड)। कृपया पुनः लॉगिन करें।`
+      );
+    },
+    [loadAuthStatus, showToast]
+  );
+
+  function handleAuthenticated(token: string, user: User, justCreatedAdmin = false) {
     setAuthToken(token);
     setCurrentUser(user);
     setDatasetQuery(DEFAULT_QUERY);
     setActiveTab('search');
+    setSyncBannerDismissed(false);
     setAuthStatus((prev) =>
       prev
         ? { ...prev, needsAdminSetup: false }
         : { needsAdminSetup: false, envAdminConfigured: false }
     );
+    if (user.role === 'admin' && justCreatedAdmin) {
+      showToast(
+        'Admin खाता बन गया! अब नीचे "Google Drive ऑटो-सिंक चालू करें" दबाकर इसे हमेशा के लिए Google Drive में सेव करें।'
+      );
+    }
   }
 
   async function handleLogout() {
@@ -130,6 +274,9 @@ export default function App() {
     setDatasetQuery(DEFAULT_QUERY);
     setSelectedRow(null);
     setActiveTab('search');
+    setDriveSyncEnabled(false);
+    setLastSyncedAt(null);
+    setShowEnableSyncModal(false);
     void loadAuthStatus();
   }
 
@@ -146,6 +293,7 @@ export default function App() {
       };
     });
     setTotalVisibleRemarks((c) => c + 1);
+    triggerAutoSyncIfEnabled();
   }
 
   function handleRemarkUpdated(rowId: number, updated: RemarkItem) {
@@ -156,6 +304,7 @@ export default function App() {
         [key]: (prev[key] ?? []).map((r) => (r.id === updated.id ? updated : r)),
       };
     });
+    triggerAutoSyncIfEnabled();
   }
 
   function handleRemarkDeleted(rowId: number, remarkId: number) {
@@ -171,6 +320,7 @@ export default function App() {
       };
     });
     setTotalVisibleRemarks((c) => Math.max(0, c - 1));
+    triggerAutoSyncIfEnabled();
   }
 
   if (statusError) {
@@ -203,7 +353,13 @@ export default function App() {
   }
 
   if (!currentUser) {
-    return <LoginView authStatus={authStatus} onAuthenticated={handleAuthenticated} />;
+    return (
+      <LoginView
+        authStatus={authStatus}
+        onAuthenticated={handleAuthenticated}
+        onRestoredFromDrive={handleRestoredFromDriveOnLogin}
+      />
+    );
   }
 
   const isAdmin = currentUser.role === 'admin';
@@ -291,10 +447,68 @@ export default function App() {
               </>
             )}
           </div>
-          <span className="text-xs text-slate-500">
-            {ROLE_META[currentUser.role].permissionSummary}
-          </span>
+
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+            {isAdmin && driveSyncEnabled ? (
+              <button
+                type="button"
+                disabled={syncingDrive}
+                onClick={() => void syncPortalToDrive({ notify: true })}
+                className="inline-flex items-center gap-1.5 font-medium text-emerald-700 hover:text-emerald-900 cursor-pointer"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncingDrive ? 'animate-spin' : ''}`} />
+                <span>
+                  {syncingDrive
+                    ? 'Google Drive में सेव हो रहा है...'
+                    : lastSyncedAt
+                    ? `Google Drive सिंक चालू · ${formatHindiDateTime(lastSyncedAt)}`
+                    : 'Google Drive ऑटो-सिंक चालू'}
+                </span>
+              </button>
+            ) : (
+              <span>{ROLE_META[currentUser.role].permissionSummary}</span>
+            )}
+          </div>
         </div>
+
+        {/* Admin Google Drive Auto-Sync Prompt Banner (shown until enabled or dismissed) */}
+        {isAdmin && !driveSyncEnabled && !syncBannerDismissed && (
+          <div className="mb-5 rounded-2xl bg-blue-50/90 border border-blue-200 px-4 sm:px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="space-y-0.5 min-w-0">
+              <p className="text-sm font-bold text-blue-950">
+                Admin खाता और पूरा डाटा Google Drive में ऑटो-सेव रखें
+              </p>
+              <p className="text-xs sm:text-sm text-blue-900/90 leading-relaxed">
+                एक बार Google Drive ऑटो-सिंक चालू करने पर आपका Admin खाता, सभी यूज़र, Excel शीट और रिमार्क लगातार Google Drive में सेव होते रहेंगे।
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {getDriveAccessToken() ? (
+                <button
+                  type="button"
+                  onClick={() => setShowEnableSyncModal(true)}
+                  className="min-h-[44px] px-4 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center gap-2 whitespace-nowrap cursor-pointer"
+                >
+                  <CloudUpload className="h-4 w-4" />
+                  <span>Google Drive ऑटो-सिंक चालू करें</span>
+                </button>
+              ) : (
+                <GoogleSignInButton
+                  onClick={() => void handleStartEnableDriveSync()}
+                  loading={connectingSync}
+                  label="Sign in with Google (ऑटो-सिंक)"
+                />
+              )}
+              <button
+                type="button"
+                onClick={() => setSyncBannerDismissed(true)}
+                className="min-h-[40px] px-3 text-xs font-semibold text-blue-900/70 hover:text-blue-950 cursor-pointer"
+              >
+                बाद में
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Inline Toast Feedback */}
         {toast && (
@@ -346,14 +560,28 @@ export default function App() {
             currentUser={currentUser}
             dataset={dataset}
             totalRemarks={totalVisibleRemarks}
+            driveSyncEnabled={driveSyncEnabled}
+            syncingDrive={syncingDrive}
+            lastSyncedAt={lastSyncedAt}
+            onRequestEnableSync={() => void handleStartEnableDriveSync()}
+            onManualSyncNow={() => syncPortalToDrive({ notify: true })}
+            onDriveBackupDeleted={() => {
+              setDriveSyncEnabled(false);
+              setLastSyncedAt(null);
+            }}
             onDatasetChanged={handleDatasetReplaced}
+            onPortalRestored={handlePortalRestoredInSession}
             onNotify={showToast}
             onOpenSearch={() => setActiveTab('search')}
           />
         )}
 
         {activeTab === 'users' && isAdmin && (
-          <UserManagement currentUser={currentUser} onNotify={showToast} />
+          <UserManagement
+            currentUser={currentUser}
+            onNotify={showToast}
+            onUsersChanged={triggerAutoSyncIfEnabled}
+          />
         )}
       </main>
 
@@ -395,6 +623,46 @@ export default function App() {
         onRemarkDeleted={handleRemarkDeleted}
         onNotify={showToast}
       />
+
+      {/* Explicit Confirmation Modal: Enable Google Drive Cloud Storage Auto-Sync */}
+      {showEnableSyncModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="enable-drive-sync-title"
+          className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <div className="bg-white border border-slate-200 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-xl">
+            <h3 id="enable-drive-sync-title" className="text-lg font-bold text-slate-900">
+              Google Drive में पोर्टल डाटा सेव और ऑटो-सिंक करें?
+            </h3>
+            <p className="text-sm text-slate-600 leading-relaxed">
+              आपके Google Drive में{' '}
+              <strong className="font-mono-tabular text-slate-900">{PORTAL_BACKUP_FILENAME}</strong>{' '}
+              फ़ाइल बनाई/अपडेट की जाएगी, जिसमें Admin और सभी यूज़र खाते, Excel डाटा तथा सभी रिमार्क सेव रहेंगे। इसके बाद हर बदलाव अपने-आप Google Drive में अपडेट होता रहेगा।
+            </p>
+            <div className="flex flex-wrap justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                disabled={syncingDrive}
+                onClick={() => setShowEnableSyncModal(false)}
+                className="min-h-[44px] px-4 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-sm font-medium text-slate-700 cursor-pointer"
+              >
+                रद्द करें
+              </button>
+              <button
+                type="button"
+                disabled={syncingDrive}
+                onClick={() => void handleConfirmEnableDriveSync()}
+                className="min-h-[44px] px-5 rounded-xl bg-blue-700 hover:bg-blue-800 disabled:opacity-60 text-white text-sm font-semibold inline-flex items-center gap-2 cursor-pointer"
+              >
+                <CloudUpload className="h-4 w-4" />
+                <span>हाँ, Google Drive में सेव और सिंक चालू करें</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

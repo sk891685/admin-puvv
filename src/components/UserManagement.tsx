@@ -8,11 +8,12 @@ import { formatHindiDateTime, ROLE_META } from '../types';
 interface UserManagementProps {
   currentUser: User;
   onNotify: (message: string) => void;
+  onUsersChanged?: () => void;
 }
 
 const ROLES: UserRole[] = ['admin', 'je', 'supervisor', 'lineman'];
 
-export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
+export function UserManagement({ currentUser, onNotify, onUsersChanged }: UserManagementProps) {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -87,6 +88,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
         `नया यूज़र "${res.user.fullName}" (User ID: ${res.user.username} · ${ROLE_META[res.user.role].label}) बनाया गया।`
       );
       await loadUsers();
+      onUsersChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'यूज़र बनाने में त्रुटि हुई।');
     } finally {
@@ -122,6 +124,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
       setEditingUser(null);
       onNotify('यूज़र जानकारी अपडेट हो गई।');
       await loadUsers();
+      onUsersChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'यूज़र अपडेट करने में त्रुटि हुई।');
     } finally {
@@ -136,6 +139,7 @@ export function UserManagement({ currentUser, onNotify }: UserManagementProps) {
       setConfirmDeleteId(null);
       onNotify('यूज़र हटा दिया गया।');
       await loadUsers();
+      onUsersChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'यूज़र हटाने में त्रुटि हुई।');
     }
