@@ -1,4 +1,4 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeApp, getApps } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
@@ -24,7 +24,10 @@ export const SCOPES = [
   'https://www.googleapis.com/auth/drive.scripts',
 ] as const;
 
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const DRIVE_FIREBASE_APP_NAME = 'google-drive-oauth';
+const app =
+  getApps().find((existing) => existing.name === DRIVE_FIREBASE_APP_NAME) ??
+  initializeApp(firebaseConfig, DRIVE_FIREBASE_APP_NAME);
 const auth = getAuth(app);
 
 const provider = new GoogleAuthProvider();
